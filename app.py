@@ -1,9 +1,14 @@
 """
 AutoLyrics - a lightweight floating lyrics viewer for Windows.
 
-* Reads the current track (Title / Artist) from the Windows System Media
-  Transport Controls (SMTC) via `winsdk` in a background thread.
-* Fetches synced / plain lyrics from the free LRCLIB API (no key needed).
+* Reads the current track (Title / Artist / Duration) AND the live playback
+  position from the Windows System Media Transport Controls (SMTC) via
+  `winsdk` in a background thread, so lyrics re-sync after seek / pause.
+* Lyrics come from a 3-layer fallback chain:
+    1. YouTube Closed Captions (browser sources only, via yt-dlp)
+    2. Synced (.lrc) lyrics from the free LRCLIB API
+    3. Plain-text lyrics from LRCLIB
+* -0.5s / +0.5s buttons nudge the timing live (remembered per track).
 * Shows them in a frameless, resizable, dark Fluent-style PyQt6 window.
 * Lives in the system tray (pystray): click toggles the window.
 """
@@ -72,14 +77,29 @@ except Exception:  # pragma: no cover
     MediaManager = None
     PlaybackStatus = None
 
+try:
+    import yt_dlp
+except Exception:  # pragma: no cover - CC layer simply gets skipped
+    yt_dlp = None
+
 APP_NAME = "AutoLyrics"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 LRCLIB_API = "https://lrclib.net/api"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (https://github.com/your-name/AutoLyrics)"
 
-POLL_INTERVAL = 0.5      # seconds between SMTC polls
+POLL_INTERVAL = 0.25     # seconds between SMTC polls
 LYRIC_LEAD = 0.25        # highlight a line slightly early (seconds)
 USER_SCROLL_PAUSE = 4.0  # seconds auto-scroll pauses after manual scrolling
+SEEK_JUMP = 1.5          # position jump (s) treated as a seek -> re-center now
+OFFSET_STEP = 0.5        # manual timing nudge (s)
+OFFSET_LIMIT = 30.0
+
+# YouTube Closed Captions layer
+ALLOW_AUTO_CC = False    # True = also accept YouTube's auto-generated captions
+CC_LANG_PREF = ("en", "en-US", "en-GB", "tl", "fil")
+CC_DURATION_TOLERANCE = 3.0   # s; search hit must match the playing video length
+BROWSER_HINTS = ("chrome", "msedge", "edge", "brave", "firefox", "opera",
+                 "vivaldi", "arc", "zen")
 
 # ----------------------------------------------------------------------------
 # Look & feel
@@ -106,15 +126,17 @@ class Lyrics:
     synced: list[tuple[float, str]] = field(default_factory=list)
     plain: str = ""
     instrumental: bool = False
+    source: str = ""            # "YouTube CC", "LRCLIB · synced", "LRCLIB · plain"
 
     def to_json(self) -> dict:
         return {"synced": self.synced, "plain": self.plain,
-                "instrumental": self.instrumental}
+                "instrumental": self.instrumental, "source": self.source}
 
     @staticmethod
     def from_json(d: dict) -> "Lyrics":
         return Lyrics([(float(t), s) for t, s in d.get("synced", [])],
-                      d.get("plain", ""), bool(d.get("instrumental", False)))
+                      d.get("plain", ""), bool(d.get("instrumental", False)),
+                      d.get("source", ""))
 
 
 _TS = re.compile(r"\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]")
@@ -198,7 +220,8 @@ def _to_lyrics(data: dict | None) -> Lyrics | None:
     instrumental = bool(data.get("instrumental"))
     if not (synced or plain or instrumental):
         return None
-    return Lyrics(synced, plain, instrumental)
+    source = "LRCLIB · synced" if synced else "LRCLIB · plain"
+    return Lyrics(synced, plain, instrumental, source)
 
 
 def _pick_best(results: list, duration: float) -> dict | None:
@@ -269,6 +292,135 @@ def fetch_lyrics(title: str, artist: str, album: str, duration: float
     return None, (failed_any and not completed_any)
 
 
+# ----------------------------------------------------------------------------
+# Layer 1: YouTube Closed Captions (browser sources)
+# ----------------------------------------------------------------------------
+_STOP_WORDS = {"official", "video", "lyrics", "lyric", "audio", "music", "hd", "hq",
+               "mv", "the", "feat", "ft", "visualizer"}
+
+
+def is_browser_source(app_id: str) -> bool:
+    a = (app_id or "").lower()
+    return any(h in a for h in BROWSER_HINTS)
+
+
+def _tokens(text: str) -> set[str]:
+    return {w for w in re.findall(r"\w+", (text or "").lower())
+            if len(w) > 1 and w not in _STOP_WORDS}
+
+
+def _find_youtube_video(title: str, artist: str, duration: float) -> str | None:
+    """Search YouTube and return the video id that matches the playing media.
+
+    SMTC does not expose the page URL, so we identify the video by title
+    overlap + (when known) matching duration."""
+    ct, ca = clean_title(title), clean_artist(artist)
+    want = _tokens(ct) or _tokens(title)
+    if not want:
+        return None
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+            "extract_flat": True, "socket_timeout": 8}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        res = ydl.extract_info(f"ytsearch5:{ca} {ct}".strip(), download=False)
+
+    best: tuple[float, float, str] | None = None
+    for e in (res or {}).get("entries") or []:
+        vid = e.get("id")
+        if not vid:
+            continue
+        overlap = len(want & _tokens(e.get("title", ""))) / len(want)
+        if overlap < 0.5:
+            continue
+        vdur = float(e.get("duration") or 0)
+        diff = abs(vdur - duration) if (duration > 0 and vdur > 0) else 0.0
+        if duration > 0 and vdur > 0 and diff > CC_DURATION_TOLERANCE:
+            continue                      # different upload (e.g. lyric video / cover)
+        if duration <= 0 and overlap < 0.8:
+            continue                      # no duration to verify -> be stricter
+        cand = (diff, -overlap, vid)
+        if best is None or cand < best:
+            best = cand
+    return best[2] if best else None
+
+
+def _pick_caption_track(pool: dict, prefs: list[str]):
+    keys = [k for k in pool if not k.startswith("live_chat")]
+    if not keys:
+        return None
+    ordered = [k for p in prefs if p for k in keys if k == p]
+    ordered += [k for k in keys if k.lower().startswith("en")]
+    ordered += keys
+    for k in ordered:
+        for fmt in pool.get(k) or []:
+            if fmt.get("ext") == "json3" and fmt.get("url"):
+                return fmt
+    return None
+
+
+def _parse_json3(data: dict) -> list[tuple[float, str]]:
+    cues: list[tuple[float, float, str]] = []
+    for ev in data.get("events", []):
+        segs = ev.get("segs")
+        if not segs or "tStartMs" not in ev:
+            continue
+        text = " ".join("".join(sg.get("utf8", "") for sg in segs).split())
+        if not text:
+            continue
+        if re.fullmatch(r"[\[\(].*[\]\)]", text):    # [Music], (Applause) ...
+            text = ""
+        start = ev["tStartMs"] / 1000.0
+        cues.append((start, start + ev.get("dDurationMs", 0) / 1000.0, text))
+    cues.sort(key=lambda c: c[0])
+
+    out: list[tuple[float, str]] = []
+    for i, (start, end, text) in enumerate(cues):
+        if text or not out or out[-1][1]:         # collapse consecutive blanks
+            out.append((start, text))
+        nxt = cues[i + 1][0] if i + 1 < len(cues) else None
+        if end > start and (nxt is None or nxt - end > 2.0) and out[-1][1]:
+            out.append((end, ""))                 # instrumental gap -> shows a note
+    return out
+
+
+def fetch_youtube_cc(title: str, artist: str, duration: float) -> Lyrics | None:
+    if yt_dlp is None:
+        return None
+    vid = _find_youtube_video(title, artist, duration)
+    if not vid:
+        return None
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+            "socket_timeout": 8}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
+    prefs = [info.get("language"), *CC_LANG_PREF]
+    pools = [info.get("subtitles") or {}]
+    if ALLOW_AUTO_CC:
+        pools.append(info.get("automatic_captions") or {})
+    for pool in pools:
+        track = _pick_caption_track(pool, prefs)
+        if not track:
+            continue
+        r = _session.get(track["url"], timeout=8)
+        r.raise_for_status()
+        lines = _parse_json3(r.json())
+        if sum(1 for _, t in lines if t) >= 3:        # ignore near-empty tracks
+            return Lyrics(synced=lines, source="YouTube CC")
+    return None
+
+
+def fetch_best_lyrics(title: str, artist: str, album: str, duration: float,
+                      app_id: str) -> tuple[Lyrics | None, bool]:
+    """CC -> LRCLIB synced -> LRCLIB plain. Returns (lyrics_or_None, network_failed)."""
+    if is_browser_source(app_id):
+        try:
+            cc = fetch_youtube_cc(title, artist, duration)
+            if cc:
+                return cc, False
+        except Exception as exc:                      # never let CC break the fallback
+            print("CC lookup failed:", exc, file=sys.stderr)
+    return fetch_lyrics(title, artist, album, duration)
+
+
 class LyricsCache:
     """Tiny JSON cache in %APPDATA%/AutoLyrics so replays are instant/offline."""
     MAX = 300
@@ -307,7 +459,7 @@ class LyricsCache:
 # SMTC watcher (background thread + asyncio)
 # ----------------------------------------------------------------------------
 class MediaWatcher(QObject):
-    track_changed = pyqtSignal(str, str, str, float)   # title, artist, album, duration
+    track_changed = pyqtSignal(str, str, str, float, str)   # title, artist, album, duration, app_id
     no_media = pyqtSignal()
     playback = pyqtSignal(float, bool)                 # position (s), is_playing
     unavailable = pyqtSignal()
@@ -354,7 +506,13 @@ class MediaWatcher(QObject):
             return None
         artist = (props.artist or "").strip()
         album = (props.album_title or "").strip()
-        playing = session.get_playback_info().playback_status == PlaybackStatus.PLAYING
+        info = session.get_playback_info()
+        playing = info.playback_status == PlaybackStatus.PLAYING
+        app_id = session.source_app_user_model_id or ""
+        try:
+            rate = float(info.playback_rate or 1.0)
+        except Exception:
+            rate = 1.0
 
         position, duration = 0.0, 0.0
         try:
@@ -365,17 +523,18 @@ class MediaWatcher(QObject):
                 updated = tl.last_updated_time
                 if updated.tzinfo is None:
                     updated = updated.replace(tzinfo=timezone.utc)
-                position += max(0.0, (datetime.now(timezone.utc) - updated).total_seconds())
+                position += max(0.0, (datetime.now(timezone.utc) - updated).total_seconds()) * rate
             if duration > 0:
                 position = min(position, duration)
         except Exception:
             pass
-        return title, artist, album, duration, position, playing
+        return title, artist, album, duration, position, playing, app_id
 
     async def _loop(self) -> None:
         manager = None
         last_key: tuple[str, str] | None = None
         had_media = False
+        pending = 0          # browsers often report duration a moment after the title
         while not self._stop.is_set():
             try:
                 if manager is None:
@@ -386,12 +545,18 @@ class MediaWatcher(QObject):
                         had_media, last_key = False, None
                         self.no_media.emit()
                 else:
-                    title, artist, album, duration, pos, playing = snap
+                    title, artist, album, duration, pos, playing, app_id = snap
                     key = (title, artist)
                     if key != last_key:
-                        last_key, had_media = key, True
-                        self.track_changed.emit(title, artist, album, duration)
-                    self.playback.emit(pos, playing)
+                        if duration <= 0 and pending < 6:
+                            pending += 1                  # wait up to ~1.5s for duration
+                        else:
+                            pending = 0
+                            last_key, had_media = key, True
+                            self.track_changed.emit(title, artist, album, duration, app_id)
+                            self.playback.emit(pos, playing)
+                    else:
+                        self.playback.emit(pos, playing)
             except Exception as exc:
                 print("SMTC error:", exc, file=sys.stderr)
                 manager = None
@@ -572,6 +737,11 @@ class LyricsView(SmoothScrollArea):
         self._user_until = time.monotonic() + USER_SCROLL_PAUSE
         self._needs_center = True
 
+    def force_follow(self) -> None:
+        """Cancel the manual-scroll pause (used after a seek)."""
+        self._user_until = 0.0
+        self._needs_center = True
+
     def set_active(self, idx: int) -> None:
         if not self.synced or idx == self.active:
             return
@@ -638,6 +808,8 @@ class LyricsWindow(QWidget):
         self._pos_base = 0.0
         self._pos_stamp = time.monotonic()
         self._playing = False
+        self.offset = 0.0              # manual timing offset (s), per track
+        self._track_key = ""
         self._last_toggle = 0.0
         self._fade: QPropertyAnimation | None = None
 
@@ -709,6 +881,48 @@ class LyricsWindow(QWidget):
         self.stack.addWidget(status)
         self.stack.addWidget(self.view)
         root.addWidget(self.stack, 1)
+
+        # footer: lyric source + manual timing offset
+        self.footer = QWidget()
+        self.footer.setCursor(Qt.CursorShape.ArrowCursor)
+        self.footer.setStyleSheet("""
+            QLabel#source{color:rgba(255,255,255,110);font-size:11px;background:transparent;}
+            QPushButton{background:rgba(255,255,255,18);border:none;border-radius:6px;
+                color:rgba(255,255,255,215);font-size:11px;font-weight:600;padding:4px 9px;}
+            QPushButton:hover{background:rgba(255,255,255,40);}
+            QPushButton:pressed{background:rgba(96,205,255,70);}
+            QPushButton#offval{background:transparent;color:%s;min-width:44px;}
+            QPushButton#offval:hover{background:rgba(255,255,255,18);}
+        """ % ACCENT)
+        f_lay = QHBoxLayout(self.footer)
+        f_lay.setContentsMargins(16, 2, 12, 10)
+        f_lay.setSpacing(4)
+        self.source_label = QLabel()
+        self.source_label.setObjectName("source")
+        f_lay.addWidget(self.source_label)
+        f_lay.addStretch()
+
+        self.offset_box = QWidget()
+        o_lay = QHBoxLayout(self.offset_box)
+        o_lay.setContentsMargins(0, 0, 0, 0)
+        o_lay.setSpacing(2)
+        self.off_minus = QPushButton(f"\u2212{OFFSET_STEP:g}s")
+        self.off_minus.setToolTip("Lyrics appear later")
+        self.off_val = QPushButton("0.0s")
+        self.off_val.setObjectName("offval")
+        self.off_val.setToolTip("Timing offset - click to reset")
+        self.off_plus = QPushButton(f"+{OFFSET_STEP:g}s")
+        self.off_plus.setToolTip("Lyrics appear earlier")
+        for b in (self.off_minus, self.off_val, self.off_plus):
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            o_lay.addWidget(b)
+        self.off_minus.clicked.connect(lambda: self.nudge_offset(-OFFSET_STEP))
+        self.off_plus.clicked.connect(lambda: self.nudge_offset(+OFFSET_STEP))
+        self.off_val.clicked.connect(lambda: self.set_offset(0.0))
+        f_lay.addWidget(self.offset_box)
+        root.addWidget(self.footer)
+        self.footer.hide()
 
     def _restore_geometry(self) -> None:
         geo = self.settings.value("geometry")
@@ -807,6 +1021,33 @@ class LyricsWindow(QWidget):
     def toggle_always_on_top(self) -> None:
         self.set_always_on_top(not self.always_on_top)
 
+    # -- manual timing offset ----------------------------------------------
+    def _load_offsets(self) -> dict:
+        try:
+            return json.loads(self.settings.value("offsets", "{}", type=str))
+        except Exception:
+            return {}
+
+    def _store_offset(self) -> None:
+        if not self._track_key:
+            return
+        data = self._load_offsets()
+        data.pop(self._track_key, None)
+        if abs(self.offset) > 1e-6:
+            data[self._track_key] = self.offset
+        while len(data) > 300:
+            data.pop(next(iter(data)))
+        self.settings.setValue("offsets", json.dumps(data))
+
+    def set_offset(self, value: float) -> None:
+        self.offset = round(max(-OFFSET_LIMIT, min(OFFSET_LIMIT, value)), 2)
+        self.off_val.setText(f"{self.offset:+.1f}s" if self.offset else "0.0s")
+        self._store_offset()
+        self.view.force_follow()
+
+    def nudge_offset(self, delta: float) -> None:
+        self.set_offset(self.offset + delta)
+
     def save_settings(self) -> None:
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("always_on_top", self.always_on_top)
@@ -828,13 +1069,17 @@ class LyricsWindow(QWidget):
         self._fade = anim
 
     def show_status(self, main: str, sub: str = "") -> None:
+        self.footer.hide()
         self.status_main.setText(main)
         self.status_sub.setText(sub)
         self.status_sub.setVisible(bool(sub))
         self.stack.setCurrentIndex(0)
         self._fade_in()
 
-    def show_lyrics_view(self) -> None:
+    def show_lyrics_view(self, source: str = "", synced: bool = False) -> None:
+        self.source_label.setText(source)
+        self.offset_box.setVisible(synced)       # offset is meaningless for plain text
+        self.footer.show()
         self.stack.setCurrentIndex(1)
         self._fade_in()
 
@@ -853,12 +1098,20 @@ class LyricsWindow(QWidget):
                          "Play something in Spotify, YouTube, or any media app.")
 
     def on_playback(self, position: float, playing: bool) -> None:
-        self._pos_base, self._pos_stamp, self._playing = position, time.monotonic(), playing
+        now = time.monotonic()
+        expected = self._pos_base + ((now - self._pos_stamp) if self._playing else 0.0)
+        if self.times and abs(position - expected) > SEEK_JUMP:
+            self.view.force_follow()             # user seeked: jump straight to the line
+        self._pos_base, self._pos_stamp, self._playing = position, now, playing
 
-    def on_track_changed(self, title: str, artist: str, album: str, duration: float) -> None:
+    def on_track_changed(self, title: str, artist: str, album: str,
+                         duration: float, app_id: str = "") -> None:
         self.token += 1
         token = self.token
         self.times = []
+        self._track_key = LyricsCache.key(title, artist)
+        self.offset = float(self._load_offsets().get(self._track_key, 0.0))
+        self.off_val.setText(f"{self.offset:+.1f}s" if self.offset else "0.0s")
         self.track_label.set_full(title)
         self.artist_label.set_full(artist)
         self.artist_label.setVisible(bool(artist))
@@ -870,14 +1123,16 @@ class LyricsWindow(QWidget):
             self._apply_lyrics(cached, title, artist)
             return
 
-        self.show_status("Loading lyrics…")
+        self.show_status(
+            "Loading lyrics…",
+            "Checking captions, then LRCLIB…" if is_browser_source(app_id) else "")
         threading.Thread(target=self._fetch_worker,
-                         args=(token, title, artist, album, duration),
+                         args=(token, title, artist, album, duration, app_id),
                          daemon=True).start()
 
-    def _fetch_worker(self, token, title, artist, album, duration) -> None:
+    def _fetch_worker(self, token, title, artist, album, duration, app_id) -> None:
         try:
-            lyr, net_fail = fetch_lyrics(title, artist, album, duration)
+            lyr, net_fail = fetch_best_lyrics(title, artist, album, duration, app_id)
         except Exception:
             lyr, net_fail = None, True
         self.lyrics_ready.emit(token, lyr, net_fail)
@@ -901,11 +1156,11 @@ class LyricsWindow(QWidget):
         if lyr.synced:
             self.times = [t for t, _ in lyr.synced]
             self.view.set_lines([s for _, s in lyr.synced], synced=True)
-            self.show_lyrics_view()
+            self.show_lyrics_view(lyr.source or "Cached", synced=True)
         elif lyr.plain:
             self.times = []
             self.view.set_lines(lyr.plain.splitlines(), synced=False)
-            self.show_lyrics_view()
+            self.show_lyrics_view(lyr.source or "LRCLIB · plain", synced=False)
         else:
             self.times = []
             self.show_status("Instrumental", f"{artist} – {title}" if artist else title)
@@ -917,6 +1172,7 @@ class LyricsWindow(QWidget):
         pos = self._pos_base
         if self._playing:
             pos += time.monotonic() - self._pos_stamp
+        pos += self.offset
         idx = bisect.bisect_right(self.times, pos + LYRIC_LEAD) - 1
         self.view.set_active(idx)
         self.view.maybe_recenter()
