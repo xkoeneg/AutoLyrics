@@ -43,8 +43,8 @@ Requires Windows 10/11 and Python 3.11 or 3.12.
 Push a version tag and GitHub Actions attaches `AutoLyrics-windows.zip` to a Release
 (extract it and run `AutoLyrics\AutoLyrics.exe`):
 
-    git tag v1.3.1
-    git push origin v1.3.1
+    git tag v1.3.2
+    git push origin v1.3.2
 
 ## Usage
 - Tray icon click: show/hide. Right-click: Show/Hide, Always on Top, Exit.

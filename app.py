@@ -89,7 +89,7 @@ except Exception:  # pragma: no cover - CC layer simply gets skipped
     yt_dlp = None
 
 APP_NAME = "AutoLyrics"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 LRCLIB_API = "https://lrclib.net/api"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (https://github.com/your-name/AutoLyrics)"
 
@@ -111,8 +111,11 @@ AI_LANGUAGE = None        # None = auto-detect; or force e.g. "tl" (Tagalog), "e
 ALLOW_AUTO_CC = True     # last-resort synced source: YouTube auto-generated captions
 CC_LANG_PREF = ("en", "en-US", "en-GB", "tl", "fil")
 CC_DURATION_TOLERANCE = 3.0   # s; search hit must match the playing video length
-BROWSER_HINTS = ("chrome", "msedge", "edge", "brave", "firefox", "opera",
-                 "vivaldi", "arc", "zen")
+# Players that can never be YouTube. Everything else (any browser, PWA, Firefox's
+# hash-style app ids, YouTube Music desktop apps...) is checked against YouTube.
+NON_YOUTUBE_HINTS = ("spotify", "applemusic", "itunes", "tidal", "deezer", "amazonmusic",
+                     "amazon music", "zunemusic", "groove", "foobar", "musicbee",
+                     "vlc", "wmplayer", "aimp", "winamp")
 
 # ----------------------------------------------------------------------------
 # Look & feel
@@ -312,9 +315,9 @@ _STOP_WORDS = {"official", "video", "lyrics", "lyric", "audio", "music", "hd", "
                "mv", "the", "feat", "ft", "visualizer"}
 
 
-def is_browser_source(app_id: str) -> bool:
+def may_be_youtube(app_id: str) -> bool:
     a = (app_id or "").lower()
-    return any(h in a for h in BROWSER_HINTS)
+    return not any(h in a for h in NON_YOUTUBE_HINTS)
 
 
 def _tokens(text: str) -> set[str]:
@@ -465,7 +468,7 @@ def fetch_best_lyrics(title: str, artist: str, album: str, duration: float,
     `trace` collects a short human-readable reason for each layer that missed."""
     trace = trace if trace is not None else []
     cc_manual = cc_auto = None
-    if is_browser_source(app_id):
+    if may_be_youtube(app_id):
         try:
             cc_manual, cc_auto = fetch_youtube_cc(title, artist, duration, trace, ctx)
         except Exception as exc:                      # never let CC break the fallback
@@ -474,7 +477,7 @@ def fetch_best_lyrics(title: str, artist: str, album: str, duration: float,
         if cc_manual:
             return cc_manual, False
     else:
-        trace.append("Captions: skipped (not a browser)")
+        trace.append(f"Captions: skipped (native player: {app_id})")
 
     lyr, net_fail = fetch_lyrics(title, artist, album, duration)
     if lyr and lyr.synced:
@@ -1337,7 +1340,7 @@ class LyricsWindow(QWidget):
 
         self.show_status(
             "Loading lyrics…",
-            "Checking captions, then LRCLIB…" if is_browser_source(app_id) else "")
+            "Checking captions, then LRCLIB…" if may_be_youtube(app_id) else "")
         threading.Thread(target=self._fetch_worker,
                          args=(token, title, artist, album, duration, app_id),
                          daemon=True).start()
