@@ -89,7 +89,7 @@ except Exception:  # pragma: no cover - CC layer simply gets skipped
     yt_dlp = None
 
 APP_NAME = "AutoLyrics"
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.6"
 LRCLIB_API = "https://lrclib.net/api"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (https://github.com/your-name/AutoLyrics)"
 
@@ -111,7 +111,9 @@ AI_LANGUAGE = None        # None = auto-detect; or force e.g. "tl" (Tagalog), "e
 
 # YouTube Closed Captions layer
 ALLOW_AUTO_CC = True     # last-resort synced source: YouTube auto-generated captions
-CC_LANG_PREF = ("en", "en-US", "en-GB", "tl", "fil")
+# Caption language order when a video has several tracks (first match wins).
+# Filipino first: English tracks on OPM videos are usually translations.
+CC_LANG_PREF = ("tl", "fil", "en")
 CC_DURATION_TOLERANCE = 3.0   # s; search hit must match the playing video length
 # Players that can never be YouTube. Everything else (any browser, PWA, Firefox's
 # hash-style app ids, YouTube Music desktop apps...) is checked against YouTube.
@@ -361,10 +363,24 @@ def _find_youtube_video(title: str, artist: str, duration: float) -> str | None:
     return best[2] if best else None
 
 
+def _log_path() -> Path:
+    return Path(os.getenv("APPDATA") or Path.home()) / APP_NAME / "debug.log"
+
+
+def _open_log() -> None:
+    try:
+        path = _log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=True)
+        os.startfile(str(path))                   # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def _log(msg: str) -> None:
     """Append to %APPDATA%/AutoLyrics/debug.log (helps when lyrics are not found)."""
     try:
-        path = Path(os.getenv("APPDATA") or Path.home()) / APP_NAME / "debug.log"
+        path = _log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.stat().st_size > 200_000:
             path.write_text("", encoding="utf-8")
@@ -374,19 +390,25 @@ def _log(msg: str) -> None:
         pass
 
 
-def _pick_caption_track(pool: dict, prefs: list, strict: bool = False):
-    """Choose a json3 caption track. strict=True (auto captions) only accepts the
-    original-language track, never machine translations."""
+def _base_lang(code: str) -> str:
+    c = (code or "").lower().replace("_", "-").split("-")[0]
+    return "tl" if c == "fil" else c
+
+
+def _pick_caption_track(pool: dict, strict: bool = False):
+    """Choose a json3 caption track -> (language_key, format) or None.
+    strict=True (auto captions) only accepts the original-language '*-orig' track,
+    never machine translations."""
     keys = [k for k in pool if not k.startswith("live_chat")]
-    ordered = [k for k in keys if k.endswith("-orig")]
-    ordered += [k for p in prefs if p for k in keys if k == p]
-    if not strict:
-        ordered += [k for k in keys if k.lower().startswith("en")]
-        ordered += keys
+    if strict:
+        ordered = [k for k in keys if k.endswith("-orig")]
+    else:
+        ordered = [k for pref in CC_LANG_PREF for k in keys
+                   if _base_lang(k) == _base_lang(pref)] + keys
     for k in ordered:
         for fmt in pool.get(k) or []:
             if fmt.get("ext") == "json3" and fmt.get("url"):
-                return fmt
+                return k, fmt
     return None
 
 
@@ -439,18 +461,19 @@ def fetch_youtube_cc(title: str, artist: str, duration: float, trace: list[str],
             "socket_timeout": 8}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
-    prefs = [info.get("language"), *CC_LANG_PREF]
 
     def load(pool: dict, strict: bool, source: str, dedupe: bool) -> Lyrics | None:
-        track = _pick_caption_track(pool, prefs, strict)
-        if not track:
+        picked = _pick_caption_track(pool, strict)
+        if not picked:
             return None
+        lang, track = picked
         r = requests.get(track["url"], timeout=8,
                          headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         lines = _parse_json3(r.json(), dedupe)
         if sum(1 for _, t in lines if t) >= 3:        # ignore near-empty tracks
-            return Lyrics(synced=lines, source=source)
+            trace.append(f"Captions: {source} [{lang}]")
+            return Lyrics(synced=lines, source=f"{source} · {lang}")
         return None
 
     manual = load(info.get("subtitles") or {}, False, "YouTube CC", False)
@@ -1018,6 +1041,8 @@ class LyricsWindow(QWidget):
         self._fresh = True             # next SMTC sample is accepted as-is (new track)
         self._jump: tuple[float, float] | None = None   # unconfirmed position jump
         self._track_dur = 0.0          # longest duration seen for this track
+        self._last_idx = -1            # last highlighted line (rewind diagnostics)
+        self._lost = False             # SMTC timeline went empty mid-track
         self._anomaly = False          # SMTC shows other media (an ad?) -> lyrics frozen
         self._anomaly_at = 0.0
         self._stale = False            # after an ad: ignore the old timeline until refreshed
@@ -1306,6 +1331,8 @@ class LyricsWindow(QWidget):
     def on_no_media(self) -> None:
         self.token += 1
         self.times = []
+        self._track_key, self._last_idx = "", -1
+        _log("media: nothing playing")
         self.info.hide()
         self.track_text_changed.emit("")
         self.show_status("Waiting for music…",
@@ -1314,6 +1341,9 @@ class LyricsWindow(QWidget):
     def on_playback(self, position: float, playing: bool,
                     duration: float = 0.0, age: float = 0.0) -> None:
         """Feed SMTC samples into a local clock that survives bad data:
+        * an EMPTY timeline (duration 0, position 0) in the middle of a track - some
+          browsers drop the timeline halfway through - is ignored and the local clock
+          keeps running until a real timeline comes back;
         * ads / other media (much shorter duration) freeze the lyrics, and the song
           resumes from the frozen point - the stale pre-ad timeline is ignored until
           the browser pushes a fresh update (or you press pause/play);
@@ -1322,6 +1352,20 @@ class LyricsWindow(QWidget):
         now = time.monotonic()
         expected = self._pos_base + ((now - self._pos_stamp) if self._playing else 0.0)
         self._track_dur = max(self._track_dur, duration)
+
+        # 0) timeline lost: no duration although this track had one -> position is junk
+        if duration <= 0 and self._track_dur > 0:
+            if not self._lost:
+                self._lost, self._jump = True, None
+                _log(f"sync: SMTC timeline empty at clock {expected:.1f}s "
+                     f"(position {position:.1f}s ignored) - using local clock")
+            if playing != self._playing:                    # still honour play / pause
+                self._pos_base, self._pos_stamp, self._playing = expected, now, playing
+            return
+        if self._lost:
+            self._lost, self._jump = False, None
+            _log(f"sync: SMTC timeline is back (reports {position:.1f}s, "
+                 f"clock {expected:.1f}s)")
 
         # 1) different media (ad) -> freeze
         odd = (duration > 0 and self._track_dur - duration > 8.0
@@ -1381,11 +1425,22 @@ class LyricsWindow(QWidget):
 
     def on_track_changed(self, title: str, artist: str, album: str,
                          duration: float, app_id: str = "") -> None:
+        new_key = LyricsCache.key(title, artist)
+        if new_key == self._track_key and self.times:
+            # Same song, only the metadata text changed: keep lyrics, scroll and clock.
+            self.track_label.set_full(title)
+            self.artist_label.set_full(artist)
+            _log(f"track: metadata refresh ignored ({artist} - {title})")
+            return
+        _log(f"track: {artist} - {title} [{duration:.0f}s, {app_id}] "
+             f"(clock was {self._pos_base:.1f}s)")
+        self._last_idx = -1
         self.token += 1
         token = self.token
         self.times = []
         self._fresh, self._jump = True, None
         self._track_dur, self._anomaly, self._stale = duration, False, False
+        self._lost = False
         self._track_key = LyricsCache.key(title, artist)
         self.offset = float(self._load_offsets().get(self._track_key, 0.0))
         self.off_val.setText(f"{self.offset:+.1f}s" if self.offset else "0.0s")
@@ -1478,6 +1533,9 @@ class LyricsWindow(QWidget):
         self._apply_lyrics(lyr, title, artist)
 
     def _apply_lyrics(self, lyr: Lyrics, title: str, artist: str) -> None:
+        self._last_idx = -1
+        _log(f"ui: lyrics applied ({lyr.source or 'cached'}, {len(lyr.synced)} lines) "
+             f"at clock {self._pos_base:.1f}s")
         if lyr.synced:
             self.times = [t for t, _ in lyr.synced]
             self.view.set_lines([s for _, s in lyr.synced], synced=True)
@@ -1499,6 +1557,11 @@ class LyricsWindow(QWidget):
             pos += time.monotonic() - self._pos_stamp
         pos += self.offset
         idx = bisect.bisect_right(self.times, pos + LYRIC_LEAD) - 1
+        if self._last_idx >= 0 and idx < self._last_idx - 2:
+            _log(f"ui: line jumped back {self._last_idx}->{idx} at {pos:.1f}s "
+                 f"(base {self._pos_base:.1f}s, playing={self._playing}, "
+                 f"offset {self.offset:+.1f}s, anomaly={self._anomaly}, stale={self._stale})")
+        self._last_idx = idx
         self.view.set_active(idx)
         self.view.maybe_recenter()
 
@@ -1575,6 +1638,7 @@ def main() -> int:
                          checked=lambda item: win.always_on_top),
         pystray.MenuItem("AI lyrics (last resort)", lambda icon, item: bridge.toggle_ai.emit(),
                          checked=lambda item: win.ai_enabled),
+        pystray.MenuItem("Open debug log", lambda icon, item: _open_log()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Exit", lambda icon, item: bridge.quit.emit()),
     )
