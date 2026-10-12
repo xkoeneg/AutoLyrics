@@ -26,6 +26,8 @@ layers missed, and details are written to `%APPDATA%\AutoLyrics\debug.log`.
 ## Timing
 - Lyrics follow the real SMTC timeline, so seeking, pausing and resuming re-sync
   automatically.
+- Ads / other media (a much shorter duration reported mid-song) freeze the lyrics; the song
+  resumes from the frozen point and the stale pre-ad timeline is ignored.
 - Glitch-proof: stale / zero positions reported by browsers are ignored, jitter is
   smoothed, and a seek is accepted once the next poll confirms it. The app also sticks to
   one media session, so two players can't make the lyrics flip-flop. Ignored glitches are
@@ -43,8 +45,8 @@ Requires Windows 10/11 and Python 3.11 or 3.12.
 Push a version tag and GitHub Actions attaches `AutoLyrics-windows.zip` to a Release
 (extract it and run `AutoLyrics\AutoLyrics.exe`):
 
-    git tag v1.3.2
-    git push origin v1.3.2
+    git tag v1.3.3
+    git push origin v1.3.3
 
 ## Usage
 - Tray icon click: show/hide. Right-click: Show/Hide, Always on Top, Exit.

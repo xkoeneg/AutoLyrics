@@ -89,7 +89,7 @@ except Exception:  # pragma: no cover - CC layer simply gets skipped
     yt_dlp = None
 
 APP_NAME = "AutoLyrics"
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 LRCLIB_API = "https://lrclib.net/api"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (https://github.com/your-name/AutoLyrics)"
 
@@ -98,6 +98,8 @@ LYRIC_LEAD = 0.25        # highlight a line slightly early (seconds)
 USER_SCROLL_PAUSE = 4.0  # seconds auto-scroll pauses after manual scrolling
 SYNC_TOLERANCE = 0.6     # s; smaller position differences are just smoothed out
 SYNC_SMOOTH = 0.3        # 0..1: how quickly small drift is corrected
+SEEK_CONFIRM = 1.5       # s a big position jump must keep making sense before we obey
+AD_MAX = 90.0            # s; after this a 'different duration' is treated as the new normal
 OFFSET_STEP = 0.5        # manual timing nudge (s)
 OFFSET_LIMIT = 30.0
 
@@ -625,7 +627,7 @@ class LyricsCache:
 class MediaWatcher(QObject):
     track_changed = pyqtSignal(str, str, str, float, str)   # title, artist, album, duration, app_id
     no_media = pyqtSignal()
-    playback = pyqtSignal(float, bool)                 # position (s), is_playing
+    playback = pyqtSignal(float, bool, float, float)   # position, is_playing, duration, age
     unavailable = pyqtSignal()
 
     def __init__(self) -> None:
@@ -633,6 +635,7 @@ class MediaWatcher(QObject):
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._sticky = ""            # app id of the session we are following
+        self._last_raw: tuple[float, float, str] | None = None   # for jump logging
 
     def start(self) -> None:
         if MediaManager is None:
@@ -692,21 +695,37 @@ class MediaWatcher(QObject):
         except Exception:
             rate = 1.0
 
-        position, duration = 0.0, 0.0
+        position, duration, age = 0.0, 0.0, 0.0
         try:
             tl = session.get_timeline_properties()
             position = tl.position.total_seconds()
+            raw = position
             duration = max(0.0, tl.end_time.total_seconds() - tl.start_time.total_seconds())
-            if playing and tl.last_updated_time:
+            if tl.last_updated_time:
                 updated = tl.last_updated_time
                 if updated.tzinfo is None:
                     updated = updated.replace(tzinfo=timezone.utc)
-                position += max(0.0, (datetime.now(timezone.utc) - updated).total_seconds()) * rate
+                age = max(0.0, (datetime.now(timezone.utc) - updated).total_seconds())
+                if playing:
+                    position += age * rate
             if duration > 0:
                 position = min(position, duration)
+            self._note_jump(title, raw, position, duration, age, playing)
         except Exception:
             pass
-        return title, artist, album, duration, position, playing, app_id
+        return title, artist, album, duration, position, playing, app_id, age
+
+    def _note_jump(self, title: str, raw: float, position: float, duration: float,
+                   age: float, playing: bool) -> None:
+        """Write unexpected SMTC position jumps to debug.log (diagnostics only)."""
+        now = time.monotonic()
+        prev, self._last_raw = self._last_raw, (now, position, title)
+        if prev and prev[2] == title:
+            expected = prev[1] + ((now - prev[0]) if playing else 0.0)
+            if abs(position - expected) > 2.0:
+                _log(f"smtc jump: {expected:.1f}s -> {position:.1f}s "
+                     f"(raw {raw:.1f}s, age {age:.1f}s, dur {duration:.0f}s, "
+                     f"playing={playing})")
 
     async def _loop(self) -> None:
         manager = None
@@ -727,7 +746,7 @@ class MediaWatcher(QObject):
                         self.no_media.emit()
                 else:
                     miss = 0
-                    title, artist, album, duration, pos, playing, app_id = snap
+                    title, artist, album, duration, pos, playing, app_id, age = snap
                     key = (title, artist)
                     if key != last_key:
                         cand_n = cand_n + 1 if key == cand_key else 1
@@ -737,10 +756,10 @@ class MediaWatcher(QObject):
                             cand_key, cand_n = None, 0
                             last_key, had_media = key, True
                             self.track_changed.emit(title, artist, album, duration, app_id)
-                            self.playback.emit(pos, playing)
+                            self.playback.emit(pos, playing, duration, age)
                     else:
                         cand_key, cand_n = None, 0
-                        self.playback.emit(pos, playing)
+                        self.playback.emit(pos, playing, duration, age)
             except Exception as exc:
                 print("SMTC error:", exc, file=sys.stderr)
                 manager = None
@@ -793,7 +812,7 @@ class TitleBar(QWidget):
         lay.setContentsMargins(16, 0, 6, 0)
         lay.setSpacing(2)
 
-        title = QLabel("♪  AutoLyrics")
+        title = QLabel(f"♪  AutoLyrics <span style='color:#7a7a80;font-weight:400;'>v{APP_VERSION}</span>")
         title.setObjectName("title")
         lay.addWidget(title)
         lay.addStretch()
@@ -998,6 +1017,11 @@ class LyricsWindow(QWidget):
         self.offset = 0.0              # manual timing offset (s), per track
         self._fresh = True             # next SMTC sample is accepted as-is (new track)
         self._jump: tuple[float, float] | None = None   # unconfirmed position jump
+        self._track_dur = 0.0          # longest duration seen for this track
+        self._anomaly = False          # SMTC shows other media (an ad?) -> lyrics frozen
+        self._anomaly_at = 0.0
+        self._stale = False            # after an ad: ignore the old timeline until refreshed
+        self._anomaly_end = 0.0
         self._track_key = ""
         self._last_toggle = 0.0
         self._fade: QPropertyAnimation | None = None
@@ -1287,34 +1311,71 @@ class LyricsWindow(QWidget):
         self.show_status("Waiting for music…",
                          "Play something in Spotify, YouTube, or any media app.")
 
-    def on_playback(self, position: float, playing: bool) -> None:
-        """Feed SMTC positions into a local clock. Browsers sometimes report a stale
-        or zero position for a moment; such glitches are ignored, jitter is smoothed,
-        and a real seek is accepted as soon as the next poll confirms it."""
+    def on_playback(self, position: float, playing: bool,
+                    duration: float = 0.0, age: float = 0.0) -> None:
+        """Feed SMTC samples into a local clock that survives bad data:
+        * ads / other media (much shorter duration) freeze the lyrics, and the song
+          resumes from the frozen point - the stale pre-ad timeline is ignored until
+          the browser pushes a fresh update (or you press pause/play);
+        * big position jumps are only obeyed after SEEK_CONFIRM seconds of agreement;
+        * small drift is smoothed."""
         now = time.monotonic()
         expected = self._pos_base + ((now - self._pos_stamp) if self._playing else 0.0)
-        delta = position - expected
+        self._track_dur = max(self._track_dur, duration)
 
-        if self._fresh or playing != self._playing:          # new track / play / pause
-            self._fresh, self._jump = False, None
+        # 1) different media (ad) -> freeze
+        odd = (duration > 0 and self._track_dur - duration > 8.0
+               and duration < self._track_dur * 0.8)
+        if odd and self._anomaly and now - self._anomaly_at > AD_MAX:
+            self._track_dur, odd = duration, False          # it is the new normal
+            self._anomaly, self._fresh = False, True
+            _log(f"sync: duration stayed {duration:.0f}s for {AD_MAX:.0f}s - accepting it")
+        if odd:
+            if not self._anomaly:
+                self._anomaly, self._anomaly_at, self._jump = True, now, None
+                self._pos_base, self._pos_stamp, self._playing = expected, now, False
+                _log(f"sync: media duration {duration:.0f}s vs song {self._track_dur:.0f}s "
+                     f"(ad?) - lyrics frozen at {expected:.1f}s")
+            return
+        if self._anomaly:
+            self._anomaly, self._stale, self._anomaly_end = False, True, now
+            self._pos_base, self._pos_stamp, self._playing = expected, now, playing
+            _log(f"sync: back to the song - resumed from {expected:.1f}s")
+            return
+
+        # 2) new track / play / pause: take the sample as it is
+        if self._fresh or playing != self._playing:
+            self._fresh = self._stale = False
+            self._jump = None
             self._pos_base, self._pos_stamp, self._playing = position, now, playing
             return
-        if abs(delta) <= SYNC_TOLERANCE:                      # normal: low-pass the jitter
+
+        # 3) after an ad the old timeline is stale until the browser sends an update
+        if self._stale:
+            if age < (now - self._anomaly_end) - 0.5:      # updated after the ad ended
+                self._stale = False
+            else:
+                return                                      # keep the local clock
+
+        delta = position - expected
+        if abs(delta) <= SYNC_TOLERANCE:                    # normal: low-pass the jitter
             self._jump = None
             self._pos_base = expected + delta * SYNC_SMOOTH
             self._pos_stamp = now
             return
 
-        # Big difference: a seek or a glitch? Believe it only if the next poll agrees.
+        # 4) big difference: a seek or a glitch? Obey only if it stays consistent
         if self._jump is not None:
             jump_pos, jump_at = self._jump
             candidate = jump_pos + ((now - jump_at) if playing else 0.0)
             if abs(position - candidate) <= SYNC_TOLERANCE:
-                self._jump = None
-                self._pos_base, self._pos_stamp = position, now
-                if self.times:
-                    self.view.force_follow()                  # seek: jump to the right line
-                return
+                if now - jump_at >= (SEEK_CONFIRM if playing else 0.5):
+                    self._jump = None
+                    self._pos_base, self._pos_stamp = position, now
+                    _log(f"sync: seek accepted {expected:.1f}s -> {position:.1f}s")
+                    if self.times:
+                        self.view.force_follow()
+                return                                      # still waiting for confirmation
         _log(f"sync: ignored position {position:.1f}s (expected {expected:.1f}s)")
         self._jump = (position, now)
 
@@ -1324,6 +1385,7 @@ class LyricsWindow(QWidget):
         token = self.token
         self.times = []
         self._fresh, self._jump = True, None
+        self._track_dur, self._anomaly, self._stale = duration, False, False
         self._track_key = LyricsCache.key(title, artist)
         self.offset = float(self._load_offsets().get(self._track_key, 0.0))
         self.off_val.setText(f"{self.offset:+.1f}s" if self.offset else "0.0s")
