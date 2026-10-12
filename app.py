@@ -1,0 +1,1025 @@
+"""
+AutoLyrics - a lightweight floating lyrics viewer for Windows.
+
+* Reads the current track (Title / Artist) from the Windows System Media
+  Transport Controls (SMTC) via `winsdk` in a background thread.
+* Fetches synced / plain lyrics from the free LRCLIB API (no key needed).
+* Shows them in a frameless, resizable, dark Fluent-style PyQt6 window.
+* Lives in the system tray (pystray): click toggles the window.
+"""
+from __future__ import annotations
+
+import asyncio
+import bisect
+import ctypes
+import json
+import operator
+import os
+import re
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from functools import reduce
+from pathlib import Path
+
+import pystray
+import requests
+from PIL import Image, ImageDraw
+from PyQt6.QtCore import (
+    QEasingCurve,
+    QObject,
+    QPoint,
+    QPropertyAnimation,
+    QRectF,
+    QSettings,
+    Qt,
+    QTimer,
+    pyqtSignal,
+)
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QGuiApplication,
+    QIcon,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
+from PyQt6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QGraphicsOpacityEffect,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+try:  # Windows only
+    from winsdk.windows.media.control import (
+        GlobalSystemMediaTransportControlsSessionManager as MediaManager,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
+    )
+except Exception:  # pragma: no cover
+    MediaManager = None
+    PlaybackStatus = None
+
+APP_NAME = "AutoLyrics"
+APP_VERSION = "1.0.0"
+LRCLIB_API = "https://lrclib.net/api"
+USER_AGENT = f"{APP_NAME}/{APP_VERSION} (https://github.com/your-name/AutoLyrics)"
+
+POLL_INTERVAL = 0.5      # seconds between SMTC polls
+LYRIC_LEAD = 0.25        # highlight a line slightly early (seconds)
+USER_SCROLL_PAUSE = 4.0  # seconds auto-scroll pauses after manual scrolling
+
+# ----------------------------------------------------------------------------
+# Look & feel
+# ----------------------------------------------------------------------------
+MARGIN = 8               # transparent outer margin = resize grip zone
+RADIUS = 12
+BG_COLOR = QColor(28, 28, 32, 246)
+BORDER_COLOR = QColor(255, 255, 255, 28)
+ACCENT = "#60cdff"
+
+LINE_DIM = ("background:transparent;color:rgba(255,255,255,105);"
+            "font-size:18px;font-weight:500;padding:6px 10px;")
+LINE_ACTIVE = ("background:transparent;color:#ffffff;"
+               "font-size:18px;font-weight:700;padding:6px 10px;")
+LINE_PLAIN = ("background:transparent;color:rgba(255,255,255,215);"
+              "font-size:16px;font-weight:500;padding:3px 10px;")
+
+
+# ----------------------------------------------------------------------------
+# Lyrics model, LRC parsing, title cleanup
+# ----------------------------------------------------------------------------
+@dataclass
+class Lyrics:
+    synced: list[tuple[float, str]] = field(default_factory=list)
+    plain: str = ""
+    instrumental: bool = False
+
+    def to_json(self) -> dict:
+        return {"synced": self.synced, "plain": self.plain,
+                "instrumental": self.instrumental}
+
+    @staticmethod
+    def from_json(d: dict) -> "Lyrics":
+        return Lyrics([(float(t), s) for t, s in d.get("synced", [])],
+                      d.get("plain", ""), bool(d.get("instrumental", False)))
+
+
+_TS = re.compile(r"\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]")
+
+
+def parse_lrc(text: str | None) -> list[tuple[float, str]]:
+    out: list[tuple[float, str]] = []
+    for raw in (text or "").splitlines():
+        stamps = list(_TS.finditer(raw))
+        if not stamps:
+            continue
+        lyric = raw[stamps[-1].end():].strip()
+        for m in stamps:
+            secs = int(m.group(1)) * 60 + float(m.group(2).replace(":", "."))
+            out.append((secs, lyric))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+_NOISE = re.compile(
+    r"\s*[\(\[\{][^\)\]\}]*\b(official|lyrics?|lyric video|music video|video|"
+    r"audio|visuali[sz]er|hd|hq|4k|remaster(?:ed)?|explicit|mv)\b[^\)\]\}]*[\)\]\}]",
+    re.I)
+_FEAT = re.compile(
+    r"\s*[\(\[]\s*(?:feat|ft|featuring)\.?\s[^\)\]]*[\)\]]|\s+(?:feat|ft)\.?\s.*$", re.I)
+_TRAILING = re.compile(r"\s*[|｜].*$")
+
+
+def clean_title(t: str) -> str:
+    t = _NOISE.sub("", t)
+    t = _FEAT.sub("", t)
+    t = _TRAILING.sub("", t)
+    return " ".join(t.split()).strip(" -–—")
+
+
+def clean_artist(a: str) -> str:
+    a = re.sub(r"\s*-\s*Topic$", "", a, flags=re.I)
+    a = re.sub(r"\s*VEVO$", "", a, flags=re.I)
+    a = re.sub(r"\s+(official|music)$", "", a, flags=re.I)
+    return " ".join(a.split())
+
+
+def build_candidates(title: str, artist: str) -> list[tuple[str, str]]:
+    """(track, artist) variants to try, most literal first."""
+    out: list[tuple[str, str]] = []
+
+    def add(t: str, a: str) -> None:
+        t, a = t.strip(), a.strip()
+        if t and (t, a) not in out:
+            out.append((t, a))
+
+    ct, ca = clean_title(title), clean_artist(artist)
+    add(title, artist)
+    add(ct, ca)
+    parts = re.split(r"\s[-–—]\s", ct, maxsplit=1)   # "Artist - Song" on YouTube
+    if len(parts) == 2:
+        add(parts[1], parts[0])
+    return out
+
+
+# ----------------------------------------------------------------------------
+# LRCLIB client
+# ----------------------------------------------------------------------------
+_session = requests.Session()
+_session.headers.update({"User-Agent": USER_AGENT})
+
+
+def _api_get(path: str, params: dict):
+    r = _session.get(f"{LRCLIB_API}{path}", params=params, timeout=8)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
+def _to_lyrics(data: dict | None) -> Lyrics | None:
+    if not data:
+        return None
+    synced = parse_lrc(data.get("syncedLyrics"))
+    plain = (data.get("plainLyrics") or "").strip()
+    instrumental = bool(data.get("instrumental"))
+    if not (synced or plain or instrumental):
+        return None
+    return Lyrics(synced, plain, instrumental)
+
+
+def _pick_best(results: list, duration: float) -> dict | None:
+    if not isinstance(results, list):
+        return None
+    scored = []
+    for r in results:
+        diff = abs((r.get("duration") or 0) - duration) if duration > 0 else 0
+        if duration > 0 and diff > 10:      # almost certainly a different recording
+            continue
+        has_text = bool(r.get("syncedLyrics") or r.get("plainLyrics") or r.get("instrumental"))
+        if not has_text:
+            continue
+        scored.append((0 if r.get("syncedLyrics") else 1, diff, r))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: (x[0], x[1]))
+    return scored[0][2]
+
+
+def fetch_lyrics(title: str, artist: str, album: str, duration: float
+                 ) -> tuple[Lyrics | None, bool]:
+    """Returns (lyrics_or_None, network_failed)."""
+    completed_any = False
+    failed_any = False
+
+    def call(path: str, params: dict):
+        nonlocal completed_any, failed_any
+        try:
+            data = _api_get(path, params)
+            completed_any = True
+            return data
+        except (requests.RequestException, ValueError):
+            failed_any = True
+            return None
+
+    cands = build_candidates(title, artist)
+
+    # 1) exact signature lookups
+    for i, (t, a) in enumerate(cands):
+        if not a:
+            continue
+        params = {"track_name": t, "artist_name": a}
+        if i == 0 and album:
+            params["album_name"] = album
+        if duration > 0:
+            params["duration"] = int(round(duration))
+        lyr = _to_lyrics(call("/get", params))
+        if lyr:
+            return lyr, False
+
+    # 2) fuzzy search
+    for t, a in cands[:3]:
+        q = f"{a} {t}".strip()
+        best = _pick_best(call("/search", {"q": q}) or [], duration)
+        lyr = _to_lyrics(best)
+        if lyr:
+            return lyr, False
+
+    t, a = cands[-1] if cands else (title, artist)
+    params = {"track_name": t}
+    if a:
+        params["artist_name"] = a
+    lyr = _to_lyrics(_pick_best(call("/search", params) or [], duration))
+    if lyr:
+        return lyr, False
+
+    return None, (failed_any and not completed_any)
+
+
+class LyricsCache:
+    """Tiny JSON cache in %APPDATA%/AutoLyrics so replays are instant/offline."""
+    MAX = 300
+
+    def __init__(self) -> None:
+        base = Path(os.getenv("APPDATA") or Path.home()) / APP_NAME
+        self.path = base / "cache.json"
+        self.data: dict[str, dict] = {}
+        try:
+            self.data = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    @staticmethod
+    def key(title: str, artist: str) -> str:
+        return f"{artist.strip().lower()}|{title.strip().lower()}"
+
+    def get(self, title: str, artist: str) -> Lyrics | None:
+        d = self.data.get(self.key(title, artist))
+        return Lyrics.from_json(d) if d else None
+
+    def put(self, title: str, artist: str, lyr: Lyrics) -> None:
+        k = self.key(title, artist)
+        self.data.pop(k, None)
+        self.data[k] = lyr.to_json()
+        while len(self.data) > self.MAX:
+            self.data.pop(next(iter(self.data)))
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self.data), encoding="utf-8")
+        except Exception:
+            pass
+
+
+# ----------------------------------------------------------------------------
+# SMTC watcher (background thread + asyncio)
+# ----------------------------------------------------------------------------
+class MediaWatcher(QObject):
+    track_changed = pyqtSignal(str, str, str, float)   # title, artist, album, duration
+    no_media = pyqtSignal()
+    playback = pyqtSignal(float, bool)                 # position (s), is_playing
+    unavailable = pyqtSignal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if MediaManager is None:
+            self.unavailable.emit()
+            return
+        self._thread = threading.Thread(target=self._thread_main, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _thread_main(self) -> None:
+        try:
+            asyncio.run(self._loop())
+        except Exception as exc:  # pragma: no cover
+            print("MediaWatcher stopped:", exc, file=sys.stderr)
+
+    @staticmethod
+    def _pick_session(manager):
+        sessions = list(manager.get_sessions())
+        for s in sessions:                       # prefer something that is playing
+            try:
+                if s.get_playback_info().playback_status == PlaybackStatus.PLAYING:
+                    return s
+            except Exception:
+                continue
+        return manager.get_current_session()
+
+    async def _snapshot(self, manager):
+        session = self._pick_session(manager)
+        if session is None:
+            return None
+        props = await session.try_get_media_properties_async()
+        title = (props.title or "").strip()
+        if not title:
+            return None
+        artist = (props.artist or "").strip()
+        album = (props.album_title or "").strip()
+        playing = session.get_playback_info().playback_status == PlaybackStatus.PLAYING
+
+        position, duration = 0.0, 0.0
+        try:
+            tl = session.get_timeline_properties()
+            position = tl.position.total_seconds()
+            duration = max(0.0, tl.end_time.total_seconds() - tl.start_time.total_seconds())
+            if playing and tl.last_updated_time:
+                updated = tl.last_updated_time
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                position += max(0.0, (datetime.now(timezone.utc) - updated).total_seconds())
+            if duration > 0:
+                position = min(position, duration)
+        except Exception:
+            pass
+        return title, artist, album, duration, position, playing
+
+    async def _loop(self) -> None:
+        manager = None
+        last_key: tuple[str, str] | None = None
+        had_media = False
+        while not self._stop.is_set():
+            try:
+                if manager is None:
+                    manager = await MediaManager.request_async()
+                snap = await self._snapshot(manager)
+                if snap is None:
+                    if had_media:
+                        had_media, last_key = False, None
+                        self.no_media.emit()
+                else:
+                    title, artist, album, duration, pos, playing = snap
+                    key = (title, artist)
+                    if key != last_key:
+                        last_key, had_media = key, True
+                        self.track_changed.emit(title, artist, album, duration)
+                    self.playback.emit(pos, playing)
+            except Exception as exc:
+                print("SMTC error:", exc, file=sys.stderr)
+                manager = None
+                await asyncio.sleep(2.0)
+            await asyncio.sleep(POLL_INTERVAL)
+
+
+# ----------------------------------------------------------------------------
+# UI building blocks
+# ----------------------------------------------------------------------------
+class ElidedLabel(QLabel):
+    def __init__(self, text: str = "") -> None:
+        super().__init__()
+        self._full = ""
+        self.setMinimumWidth(1)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.set_full(text)
+
+    def set_full(self, text: str) -> None:
+        self._full = text
+        self._elide()
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        self._elide()
+
+    def _elide(self) -> None:
+        self.setText(self.fontMetrics().elidedText(
+            self._full, Qt.TextElideMode.ElideRight, max(self.width() - 2, 10)))
+
+
+class TitleBar(QWidget):
+    minimize_clicked = pyqtSignal()
+    close_clicked = pyqtSignal()
+    pin_toggled = pyqtSignal(bool)
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(40)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.setStyleSheet("""
+            QLabel#title{color:rgba(255,255,255,175);font-size:12px;font-weight:600;}
+            QPushButton{background:transparent;border:none;border-radius:6px;
+                color:rgba(255,255,255,200);font-family:'Segoe MDL2 Assets';font-size:10px;}
+            QPushButton:hover{background:rgba(255,255,255,26);}
+            QPushButton:checked{color:%s;}
+            QPushButton#close:hover{background:#c42b1c;color:white;}
+        """ % ACCENT)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(16, 0, 6, 0)
+        lay.setSpacing(2)
+
+        title = QLabel("♪  AutoLyrics")
+        title.setObjectName("title")
+        lay.addWidget(title)
+        lay.addStretch()
+
+        self.pin_btn = self._button("\uE718", "Always on top", "pin")
+        self.pin_btn.setCheckable(True)
+        self.pin_btn.toggled.connect(self._on_pin)
+        self.min_btn = self._button("\uE921", "Minimize", "min")
+        self.min_btn.clicked.connect(self.minimize_clicked)
+        self.close_btn = self._button("\uE8BB", "Hide to tray", "close")
+        self.close_btn.clicked.connect(self.close_clicked)
+        for b in (self.pin_btn, self.min_btn, self.close_btn):
+            lay.addWidget(b)
+
+    def _button(self, glyph: str, tip: str, name: str) -> QPushButton:
+        b = QPushButton(glyph)
+        b.setObjectName(name)
+        b.setToolTip(tip)
+        b.setFixedSize(36, 28)
+        b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        b.setCursor(Qt.CursorShape.ArrowCursor)
+        return b
+
+    def _on_pin(self, on: bool) -> None:
+        self.pin_btn.setText("\uE840" if on else "\uE718")
+        self.pin_toggled.emit(on)
+
+    def set_pinned(self, on: bool) -> None:
+        self.pin_btn.blockSignals(True)
+        self.pin_btn.setChecked(on)
+        self.pin_btn.setText("\uE840" if on else "\uE718")
+        self.pin_btn.blockSignals(False)
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.LeftButton:
+            handle = self.window().windowHandle()
+            if handle:
+                handle.startSystemMove()   # native drag: works with Aero Snap
+        super().mousePressEvent(e)
+
+
+class SmoothScrollArea(QScrollArea):
+    user_scrolled = pyqtSignal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+        self.viewport().setStyleSheet("background:transparent;")
+        self._anim = QPropertyAnimation(self.verticalScrollBar(), b"value", self)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._target = 0
+
+    def animate_to(self, y: int, ms: int = 380) -> None:
+        bar = self.verticalScrollBar()
+        y = max(bar.minimum(), min(bar.maximum(), int(y)))
+        self._target = y
+        self._anim.stop()
+        self._anim.setStartValue(bar.value())
+        self._anim.setEndValue(y)
+        self._anim.setDuration(ms)
+        self._anim.start()
+
+    def wheelEvent(self, e) -> None:
+        base = (self._target
+                if self._anim.state() == QPropertyAnimation.State.Running
+                else self.verticalScrollBar().value())
+        self.animate_to(base - e.angleDelta().y() * 0.9, 300)
+        self.user_scrolled.emit()
+        e.accept()
+
+
+class LyricsView(SmoothScrollArea):
+    def __init__(self) -> None:
+        super().__init__()
+        self.container = QWidget()
+        self.container.setStyleSheet("background:transparent;")
+        self.vbox = QVBoxLayout(self.container)
+        self.vbox.setSpacing(2)
+        self.setWidget(self.container)
+
+        self.labels: list[QLabel] = []
+        self.synced = False
+        self.active = -1
+        self._user_until = 0.0
+        self._needs_center = False
+        self.user_scrolled.connect(self._on_user_scroll)
+
+    # -- content -----------------------------------------------------------
+    def set_lines(self, lines: list[str], synced: bool) -> None:
+        for lbl in self.labels:
+            self.vbox.removeWidget(lbl)
+            lbl.setParent(None)
+            lbl.deleteLater()
+        self.labels.clear()
+        self.synced, self.active, self._needs_center = synced, -1, False
+        self._user_until = 0.0
+
+        for text in lines:
+            lbl = QLabel(text if text.strip() else ("♪" if synced else " "))
+            lbl.setWordWrap(True)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+            lbl.setStyleSheet(LINE_DIM if synced else LINE_PLAIN)
+            self.vbox.addWidget(lbl)
+            self.labels.append(lbl)
+        self._apply_margins()
+        self._anim.stop()
+        self.verticalScrollBar().setValue(0)
+
+    def _apply_margins(self) -> None:
+        pad = self.viewport().height() // 2 if self.synced else 16
+        self.vbox.setContentsMargins(12, pad, 12, pad)
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        self._apply_margins()
+        self._needs_center = True
+
+    # -- sync --------------------------------------------------------------
+    def _on_user_scroll(self) -> None:
+        self._user_until = time.monotonic() + USER_SCROLL_PAUSE
+        self._needs_center = True
+
+    def set_active(self, idx: int) -> None:
+        if not self.synced or idx == self.active:
+            return
+        if 0 <= self.active < len(self.labels):
+            self.labels[self.active].setStyleSheet(LINE_DIM)
+        self.active = idx
+        if 0 <= idx < len(self.labels):
+            self.labels[idx].setStyleSheet(LINE_ACTIVE)
+        self._needs_center = True
+
+    def maybe_recenter(self) -> None:
+        if not (self.synced and self._needs_center):
+            return
+        if time.monotonic() < self._user_until:
+            return
+        self._needs_center = False
+        if self.active < 0:
+            self.animate_to(0)
+            return
+        lbl = self.labels[self.active]
+        self.animate_to(lbl.y() + lbl.height() // 2 - self.viewport().height() // 2)
+
+
+# ----------------------------------------------------------------------------
+# Main window
+# ----------------------------------------------------------------------------
+def _cursor_for(edges) -> Qt.CursorShape | None:
+    if edges is None:
+        return None
+    L, R = bool(edges & Qt.Edge.LeftEdge), bool(edges & Qt.Edge.RightEdge)
+    T, B = bool(edges & Qt.Edge.TopEdge), bool(edges & Qt.Edge.BottomEdge)
+    if (L and T) or (R and B):
+        return Qt.CursorShape.SizeFDiagCursor
+    if (R and T) or (L and B):
+        return Qt.CursorShape.SizeBDiagCursor
+    if L or R:
+        return Qt.CursorShape.SizeHorCursor
+    return Qt.CursorShape.SizeVerCursor
+
+
+class LyricsWindow(QWidget):
+    lyrics_ready = pyqtSignal(int, object, bool)   # token, Lyrics|None, network_failed
+    always_on_top_changed = pyqtSignal(bool)
+    track_text_changed = pyqtSignal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.settings = QSettings(APP_NAME, APP_NAME)
+        self.cache = LyricsCache()
+        self.always_on_top = self.settings.value("always_on_top", True, type=bool)
+
+        flags = Qt.WindowType.FramelessWindowHint
+        if self.always_on_top:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self.setWindowTitle(APP_NAME)
+        self.setMinimumSize(280, 320)
+
+        # state
+        self.token = 0
+        self.times: list[float] = []
+        self._pos_base = 0.0
+        self._pos_stamp = time.monotonic()
+        self._playing = False
+        self._last_toggle = 0.0
+        self._fade: QPropertyAnimation | None = None
+
+        self._build_ui()
+        self._restore_geometry()
+        self.titlebar.set_pinned(self.always_on_top)
+
+        self.lyrics_ready.connect(self._on_lyrics_ready)
+        self.timer = QTimer(self)
+        self.timer.setInterval(100)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start()
+
+        self.show_status("Waiting for music…",
+                         "Play something in Spotify, YouTube, or any media app.")
+
+    # -- construction ------------------------------------------------------
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(MARGIN, MARGIN, MARGIN, MARGIN)
+        root.setSpacing(0)
+
+        self.titlebar = TitleBar(self)
+        self.titlebar.close_clicked.connect(self.hide)
+        self.titlebar.minimize_clicked.connect(self.showMinimized)
+        self.titlebar.pin_toggled.connect(self.set_always_on_top)
+        root.addWidget(self.titlebar)
+
+        # track header
+        self.info = QWidget()
+        self.info.setCursor(Qt.CursorShape.ArrowCursor)
+        info_lay = QVBoxLayout(self.info)
+        info_lay.setContentsMargins(18, 0, 18, 8)
+        info_lay.setSpacing(0)
+        self.track_label = ElidedLabel()
+        self.track_label.setStyleSheet(
+            "color:white;font-size:15px;font-weight:700;background:transparent;")
+        self.artist_label = ElidedLabel()
+        self.artist_label.setStyleSheet(
+            "color:rgba(255,255,255,140);font-size:12px;background:transparent;")
+        info_lay.addWidget(self.track_label)
+        info_lay.addWidget(self.artist_label)
+        root.addWidget(self.info)
+        self.info.hide()
+
+        # stacked content: 0 = status, 1 = lyrics
+        self.stack = QStackedWidget()
+        self.stack.setCursor(Qt.CursorShape.ArrowCursor)
+        status = QWidget()
+        s_lay = QVBoxLayout(status)
+        s_lay.setContentsMargins(24, 0, 24, 40)
+        s_lay.addStretch()
+        self.status_main = QLabel()
+        self.status_main.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_main.setWordWrap(True)
+        self.status_main.setStyleSheet(
+            "color:rgba(255,255,255,225);font-size:20px;font-weight:600;background:transparent;")
+        self.status_sub = QLabel()
+        self.status_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_sub.setWordWrap(True)
+        self.status_sub.setStyleSheet(
+            "color:rgba(255,255,255,120);font-size:13px;background:transparent;")
+        s_lay.addWidget(self.status_main)
+        s_lay.addSpacing(6)
+        s_lay.addWidget(self.status_sub)
+        s_lay.addStretch()
+
+        self.view = LyricsView()
+        self.stack.addWidget(status)
+        self.stack.addWidget(self.view)
+        root.addWidget(self.stack, 1)
+
+    def _restore_geometry(self) -> None:
+        geo = self.settings.value("geometry")
+        if geo:
+            self.restoreGeometry(geo)
+        else:
+            self.resize(400, 580)
+            area = QGuiApplication.primaryScreen().availableGeometry()
+            self.move(area.right() - self.width() - 24, area.bottom() - self.height() - 24)
+
+    # -- painting & edge resizing -------------------------------------------
+    def paintEvent(self, _) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # near-invisible fill so the transparent resize border still receives the mouse
+        p.fillRect(self.rect(), QColor(0, 0, 0, 1))
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()).adjusted(MARGIN, MARGIN, -MARGIN, -MARGIN),
+                            RADIUS, RADIUS)
+        p.fillPath(path, BG_COLOR)
+        p.setPen(QPen(BORDER_COLOR, 1))
+        p.drawPath(path)
+
+    def _edges_at(self, pos: QPoint):
+        r, flags = self.rect(), []
+        if pos.x() <= MARGIN:
+            flags.append(Qt.Edge.LeftEdge)
+        if pos.x() >= r.width() - MARGIN:
+            flags.append(Qt.Edge.RightEdge)
+        if pos.y() <= MARGIN:
+            flags.append(Qt.Edge.TopEdge)
+        if pos.y() >= r.height() - MARGIN:
+            flags.append(Qt.Edge.BottomEdge)
+        return reduce(operator.or_, flags) if flags else None
+
+    def mouseMoveEvent(self, e) -> None:
+        cur = _cursor_for(self._edges_at(e.position().toPoint()))
+        if cur is None:
+            self.unsetCursor()
+        else:
+            self.setCursor(cur)
+        super().mouseMoveEvent(e)
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.LeftButton:
+            edges = self._edges_at(e.position().toPoint())
+            if edges is not None and self.windowHandle():
+                self.windowHandle().startSystemResize(edges)
+                return
+        super().mousePressEvent(e)
+
+    def closeEvent(self, e) -> None:    # Alt+F4 etc. -> hide to tray
+        e.ignore()
+        self.hide()
+
+    # -- window actions ----------------------------------------------------
+    def toggle_visibility(self) -> None:
+        now = time.monotonic()
+        if now - self._last_toggle < 0.4:      # a double-click counts as one toggle
+            return
+        self._last_toggle = now
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self.bring_to_front()
+
+    def bring_to_front(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def set_always_on_top(self, on: bool) -> None:
+        self.always_on_top = on
+        self.titlebar.set_pinned(on)
+        self.settings.setValue("always_on_top", on)
+        applied = False
+        if sys.platform == "win32" and self.isVisible():
+            try:
+                user32 = ctypes.windll.user32
+                user32.SetWindowPos.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+                # HWND_TOPMOST=-1 / HWND_NOTOPMOST=-2 ; NOSIZE|NOMOVE|NOACTIVATE
+                user32.SetWindowPos(int(self.winId()), -1 if on else -2,
+                                    0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+                applied = True
+            except Exception:
+                applied = False
+        if not applied:
+            visible = self.isVisible()
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+            if visible:
+                self.show()
+        self.always_on_top_changed.emit(on)
+
+    def toggle_always_on_top(self) -> None:
+        self.set_always_on_top(not self.always_on_top)
+
+    def save_settings(self) -> None:
+        self.settings.setValue("geometry", self.saveGeometry())
+        self.settings.setValue("always_on_top", self.always_on_top)
+        self.settings.sync()
+
+    # -- states ------------------------------------------------------------
+    def _fade_in(self) -> None:
+        if self._fade:
+            self._fade.stop()
+        eff = QGraphicsOpacityEffect(self.stack)
+        eff.setOpacity(0.0)
+        self.stack.setGraphicsEffect(eff)
+        anim = QPropertyAnimation(eff, b"opacity", self)
+        anim.setDuration(240)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.finished.connect(lambda: self.stack.setGraphicsEffect(None))
+        anim.start()
+        self._fade = anim
+
+    def show_status(self, main: str, sub: str = "") -> None:
+        self.status_main.setText(main)
+        self.status_sub.setText(sub)
+        self.status_sub.setVisible(bool(sub))
+        self.stack.setCurrentIndex(0)
+        self._fade_in()
+
+    def show_lyrics_view(self) -> None:
+        self.stack.setCurrentIndex(1)
+        self._fade_in()
+
+    def show_unavailable(self) -> None:
+        self.show_status("Media access unavailable",
+                         "The 'winsdk' package could not be loaded. "
+                         "Run: pip install winsdk (Windows only).")
+
+    # -- media events (queued from the watcher thread) ----------------------
+    def on_no_media(self) -> None:
+        self.token += 1
+        self.times = []
+        self.info.hide()
+        self.track_text_changed.emit("")
+        self.show_status("Waiting for music…",
+                         "Play something in Spotify, YouTube, or any media app.")
+
+    def on_playback(self, position: float, playing: bool) -> None:
+        self._pos_base, self._pos_stamp, self._playing = position, time.monotonic(), playing
+
+    def on_track_changed(self, title: str, artist: str, album: str, duration: float) -> None:
+        self.token += 1
+        token = self.token
+        self.times = []
+        self.track_label.set_full(title)
+        self.artist_label.set_full(artist)
+        self.artist_label.setVisible(bool(artist))
+        self.info.show()
+        self.track_text_changed.emit(f"{artist} – {title}" if artist else title)
+
+        cached = self.cache.get(title, artist)
+        if cached:
+            self._apply_lyrics(cached, title, artist)
+            return
+
+        self.show_status("Loading lyrics…")
+        threading.Thread(target=self._fetch_worker,
+                         args=(token, title, artist, album, duration),
+                         daemon=True).start()
+
+    def _fetch_worker(self, token, title, artist, album, duration) -> None:
+        try:
+            lyr, net_fail = fetch_lyrics(title, artist, album, duration)
+        except Exception:
+            lyr, net_fail = None, True
+        self.lyrics_ready.emit(token, lyr, net_fail)
+
+    def _on_lyrics_ready(self, token: int, lyr, net_fail: bool) -> None:
+        if token != self.token:
+            return                              # stale result for an older track
+        title, artist = self.track_label._full, self.artist_label._full
+        if lyr is None:
+            self.times = []
+            if net_fail:
+                self.show_status("Couldn't reach LRCLIB", "Check your internet connection.")
+            else:
+                self.show_status("No lyrics found",
+                                 f"{artist} – {title}" if artist else title)
+            return
+        self.cache.put(title, artist, lyr)
+        self._apply_lyrics(lyr, title, artist)
+
+    def _apply_lyrics(self, lyr: Lyrics, title: str, artist: str) -> None:
+        if lyr.synced:
+            self.times = [t for t, _ in lyr.synced]
+            self.view.set_lines([s for _, s in lyr.synced], synced=True)
+            self.show_lyrics_view()
+        elif lyr.plain:
+            self.times = []
+            self.view.set_lines(lyr.plain.splitlines(), synced=False)
+            self.show_lyrics_view()
+        else:
+            self.times = []
+            self.show_status("Instrumental", f"{artist} – {title}" if artist else title)
+
+    # -- sync tick ---------------------------------------------------------
+    def _tick(self) -> None:
+        if not self.times or not self.isVisible() or self.isMinimized():
+            return
+        pos = self._pos_base
+        if self._playing:
+            pos += time.monotonic() - self._pos_stamp
+        idx = bisect.bisect_right(self.times, pos + LYRIC_LEAD) - 1
+        self.view.set_active(idx)
+        self.view.maybe_recenter()
+
+
+# ----------------------------------------------------------------------------
+# Tray icon
+# ----------------------------------------------------------------------------
+def make_icon_image(size: int = 64) -> Image.Image:
+    s = size / 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((0, 0, size - 1, size - 1), radius=size * 0.22, fill=(32, 32, 36, 255))
+    accent = (96, 205, 255, 255)
+    d.ellipse((16 * s, 38 * s, 32 * s, 52 * s), fill=accent)          # note head
+    d.rectangle((29 * s, 14 * s, 33 * s, 46 * s), fill=accent)         # stem
+    d.polygon([(33 * s, 14 * s), (48 * s, 20 * s), (48 * s, 28 * s), (33 * s, 22 * s)],
+              fill=accent)                                             # flag
+    return img
+
+
+def pil_to_pixmap(img: Image.Image) -> QPixmap:
+    img = img.convert("RGBA")
+    data = img.tobytes("raw", "RGBA")
+    qimg = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888)
+    return QPixmap.fromImage(qimg.copy())
+
+
+class TrayBridge(QObject):
+    """pystray runs in its own thread; these signals hop back to the Qt thread."""
+    toggle = pyqtSignal()
+    toggle_aot = pyqtSignal()
+    quit = pyqtSignal()
+
+
+# ----------------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------------
+def main() -> int:
+    if sys.platform != "win32":
+        print("AutoLyrics only runs on Windows (SMTC is a Windows API).")
+        return 1
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("AutoLyrics.App")
+    except Exception:
+        pass
+
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setQuitOnLastWindowClosed(False)
+    app.setFont(QFont("Segoe UI", 10))
+    app.setWindowIcon(QIcon(pil_to_pixmap(make_icon_image(128))))
+
+    win = LyricsWindow()
+    watcher = MediaWatcher()
+    watcher.track_changed.connect(win.on_track_changed)
+    watcher.no_media.connect(win.on_no_media)
+    watcher.playback.connect(win.on_playback)
+    watcher.unavailable.connect(win.show_unavailable)
+
+    # --- tray -------------------------------------------------------------
+    bridge = TrayBridge()
+    bridge.toggle.connect(win.toggle_visibility)
+    bridge.toggle_aot.connect(win.toggle_always_on_top)
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Show/Hide Lyrics", lambda icon, item: bridge.toggle.emit(),
+                         default=True),                  # default = left-click action
+        pystray.MenuItem("Always on Top", lambda icon, item: bridge.toggle_aot.emit(),
+                         checked=lambda item: win.always_on_top),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Exit", lambda icon, item: bridge.quit.emit()),
+    )
+    tray = pystray.Icon(APP_NAME, make_icon_image(64), APP_NAME, menu)
+
+    win.always_on_top_changed.connect(lambda _on: tray.update_menu())
+
+    def update_tooltip(text: str) -> None:
+        try:
+            tray.title = (f"{APP_NAME} – {text}" if text else APP_NAME)[:120]
+        except Exception:
+            pass
+
+    win.track_text_changed.connect(update_tooltip)
+
+    def quit_app() -> None:
+        watcher.stop()
+        win.save_settings()
+        try:
+            tray.stop()
+        except Exception:
+            pass
+        app.quit()
+
+    bridge.quit.connect(quit_app)
+    app.aboutToQuit.connect(win.save_settings)
+
+    tray.run_detached()
+    if "--minimized" not in sys.argv:
+        win.show()
+    watcher.start()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
