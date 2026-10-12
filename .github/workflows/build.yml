@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # needed to attach the .exe to a GitHub Release
+  contents: write   # needed to attach the build to a GitHub Release
 
 concurrency:
   group: build-${{ github.ref }}
@@ -34,25 +34,34 @@ jobs:
       - name: Syntax check
         run: python -m py_compile app.py
 
-      - name: Build executable
+      # onedir (not onefile): the AI libraries make the app large, and onefile would
+      # unpack hundreds of MB on every launch (slow start / "decompression" errors).
+      - name: Build application
         run: >-
-          pyinstaller --noconfirm --clean --onefile --windowed
+          pyinstaller --noconfirm --clean --onedir --windowed
           --name AutoLyrics
           --collect-all winsdk
           --collect-all yt_dlp
+          --collect-all faster_whisper
+          --collect-all ctranslate2
+          --collect-all onnxruntime
+          --collect-all av
           --hidden-import pystray._win32
           app.py
+
+      - name: Zip build
+        run: Compress-Archive -Path dist/AutoLyrics -DestinationPath dist/AutoLyrics-windows.zip
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: AutoLyrics-windows
-          path: dist/AutoLyrics.exe
+          path: dist/AutoLyrics-windows.zip
           if-no-files-found: error
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/AutoLyrics.exe
+          files: dist/AutoLyrics-windows.zip
           generate_release_notes: true

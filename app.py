@@ -17,11 +17,13 @@ from __future__ import annotations
 import asyncio
 import bisect
 import ctypes
+import gc
 import json
 import operator
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -77,25 +79,36 @@ except Exception:  # pragma: no cover
     MediaManager = None
     PlaybackStatus = None
 
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
 try:
     import yt_dlp
 except Exception:  # pragma: no cover - CC layer simply gets skipped
     yt_dlp = None
 
 APP_NAME = "AutoLyrics"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.3.1"
 LRCLIB_API = "https://lrclib.net/api"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (https://github.com/your-name/AutoLyrics)"
 
 POLL_INTERVAL = 0.25     # seconds between SMTC polls
 LYRIC_LEAD = 0.25        # highlight a line slightly early (seconds)
 USER_SCROLL_PAUSE = 4.0  # seconds auto-scroll pauses after manual scrolling
-SEEK_JUMP = 1.5          # position jump (s) treated as a seek -> re-center now
+SYNC_TOLERANCE = 0.6     # s; smaller position differences are just smoothed out
+SYNC_SMOOTH = 0.3        # 0..1: how quickly small drift is corrected
 OFFSET_STEP = 0.5        # manual timing nudge (s)
 OFFSET_LIMIT = 30.0
 
+# AI transcription (last resort, YouTube sources only)
+AI_MODEL = "small"        # "base" = lighter (~150MB) but weaker at Tagalog
+AI_THREADS = 2            # CPU threads used while transcribing
+AI_MAX_SECONDS = 900      # skip videos longer than this (15 min)
+AI_LANGUAGE = None        # None = auto-detect; or force e.g. "tl" (Tagalog), "en"
+
 # YouTube Closed Captions layer
-ALLOW_AUTO_CC = False    # True = also accept YouTube's auto-generated captions
+ALLOW_AUTO_CC = True     # last-resort synced source: YouTube auto-generated captions
 CC_LANG_PREF = ("en", "en-US", "en-GB", "tl", "fil")
 CC_DURATION_TOLERANCE = 3.0   # s; search hit must match the playing video length
 BROWSER_HINTS = ("chrome", "msedge", "edge", "brave", "firefox", "opera",
@@ -343,13 +356,28 @@ def _find_youtube_video(title: str, artist: str, duration: float) -> str | None:
     return best[2] if best else None
 
 
-def _pick_caption_track(pool: dict, prefs: list[str]):
+def _log(msg: str) -> None:
+    """Append to %APPDATA%/AutoLyrics/debug.log (helps when lyrics are not found)."""
+    try:
+        path = Path(os.getenv("APPDATA") or Path.home()) / APP_NAME / "debug.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > 200_000:
+            path.write_text("", encoding="utf-8")
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+    except Exception:
+        pass
+
+
+def _pick_caption_track(pool: dict, prefs: list, strict: bool = False):
+    """Choose a json3 caption track. strict=True (auto captions) only accepts the
+    original-language track, never machine translations."""
     keys = [k for k in pool if not k.startswith("live_chat")]
-    if not keys:
-        return None
-    ordered = [k for p in prefs if p for k in keys if k == p]
-    ordered += [k for k in keys if k.lower().startswith("en")]
-    ordered += keys
+    ordered = [k for k in keys if k.endswith("-orig")]
+    ordered += [k for p in prefs if p for k in keys if k == p]
+    if not strict:
+        ordered += [k for k in keys if k.lower().startswith("en")]
+        ordered += keys
     for k in ordered:
         for fmt in pool.get(k) or []:
             if fmt.get("ext") == "json3" and fmt.get("url"):
@@ -357,7 +385,7 @@ def _pick_caption_track(pool: dict, prefs: list[str]):
     return None
 
 
-def _parse_json3(data: dict) -> list[tuple[float, str]]:
+def _parse_json3(data: dict, dedupe: bool = False) -> list[tuple[float, str]]:
     cues: list[tuple[float, float, str]] = []
     for ev in data.get("events", []):
         segs = ev.get("segs")
@@ -372,6 +400,14 @@ def _parse_json3(data: dict) -> list[tuple[float, str]]:
         cues.append((start, start + ev.get("dDurationMs", 0) / 1000.0, text))
     cues.sort(key=lambda c: c[0])
 
+    if dedupe:                                    # auto captions repeat rolling lines
+        kept: list[tuple[float, float, str]] = []
+        for c in cues:
+            if kept and c[2] and c[2] == kept[-1][2]:
+                continue
+            kept.append(c)
+        cues = kept
+
     out: list[tuple[float, str]] = []
     for i, (start, end, text) in enumerate(cues):
         if text or not out or out[-1][1]:         # collapse consecutive blanks
@@ -382,43 +418,168 @@ def _parse_json3(data: dict) -> list[tuple[float, str]]:
     return out
 
 
-def fetch_youtube_cc(title: str, artist: str, duration: float) -> Lyrics | None:
+def fetch_youtube_cc(title: str, artist: str, duration: float, trace: list[str],
+                     ctx: dict | None = None) -> tuple[Lyrics | None, Lyrics | None]:
+    """Returns (manual_cc, auto_cc). auto_cc is only looked up when manual is missing."""
     if yt_dlp is None:
-        return None
+        trace.append("Captions: yt-dlp missing")
+        return None, None
     vid = _find_youtube_video(title, artist, duration)
     if not vid:
-        return None
+        trace.append("Captions: no matching YouTube video")
+        return None, None
+    if ctx is not None:
+        ctx["vid"] = vid                      # lets the AI layer reuse the matched video
     opts = {"quiet": True, "no_warnings": True, "skip_download": True,
             "socket_timeout": 8}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
     prefs = [info.get("language"), *CC_LANG_PREF]
-    pools = [info.get("subtitles") or {}]
-    if ALLOW_AUTO_CC:
-        pools.append(info.get("automatic_captions") or {})
-    for pool in pools:
-        track = _pick_caption_track(pool, prefs)
+
+    def load(pool: dict, strict: bool, source: str, dedupe: bool) -> Lyrics | None:
+        track = _pick_caption_track(pool, prefs, strict)
         if not track:
-            continue
-        r = _session.get(track["url"], timeout=8)
+            return None
+        r = requests.get(track["url"], timeout=8,
+                         headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
-        lines = _parse_json3(r.json())
+        lines = _parse_json3(r.json(), dedupe)
         if sum(1 for _, t in lines if t) >= 3:        # ignore near-empty tracks
-            return Lyrics(synced=lines, source="YouTube CC")
-    return None
+            return Lyrics(synced=lines, source=source)
+        return None
+
+    manual = load(info.get("subtitles") or {}, False, "YouTube CC", False)
+    if manual:
+        return manual, None
+    auto = None
+    if ALLOW_AUTO_CC:
+        auto = load(info.get("automatic_captions") or {}, True, "YouTube auto-CC", True)
+    trace.append("Captions: no uploaded CC" + (", auto-CC found" if auto else ", no auto-CC"))
+    return None, auto
 
 
 def fetch_best_lyrics(title: str, artist: str, album: str, duration: float,
-                      app_id: str) -> tuple[Lyrics | None, bool]:
-    """CC -> LRCLIB synced -> LRCLIB plain. Returns (lyrics_or_None, network_failed)."""
+                      app_id: str, trace: list[str] | None = None,
+                      ctx: dict | None = None) -> tuple[Lyrics | None, bool]:
+    """CC -> LRCLIB synced -> auto-CC -> LRCLIB plain. Returns (lyrics, network_failed).
+    `trace` collects a short human-readable reason for each layer that missed."""
+    trace = trace if trace is not None else []
+    cc_manual = cc_auto = None
     if is_browser_source(app_id):
         try:
-            cc = fetch_youtube_cc(title, artist, duration)
-            if cc:
-                return cc, False
+            cc_manual, cc_auto = fetch_youtube_cc(title, artist, duration, trace, ctx)
         except Exception as exc:                      # never let CC break the fallback
-            print("CC lookup failed:", exc, file=sys.stderr)
-    return fetch_lyrics(title, artist, album, duration)
+            trace.append(f"Captions: error ({type(exc).__name__})")
+            _log(f"CC error for {artist} - {title}: {exc!r}")
+        if cc_manual:
+            return cc_manual, False
+    else:
+        trace.append("Captions: skipped (not a browser)")
+
+    lyr, net_fail = fetch_lyrics(title, artist, album, duration)
+    if lyr and lyr.synced:
+        return lyr, False
+    if cc_auto:
+        return cc_auto, False
+    trace.append("LRCLIB: offline" if net_fail else
+                 ("LRCLIB: plain text only" if lyr else "LRCLIB: not found"))
+    return lyr, net_fail
+
+
+# ----------------------------------------------------------------------------
+# Last resort: AI transcription of the YouTube audio (faster-whisper, CPU, int8)
+# ----------------------------------------------------------------------------
+_ai_lock = threading.Lock()
+_HALLUCINATION = re.compile(
+    r"thanks for watching|please subscribe|amara\.org|subtitles? by|www\.", re.I)
+
+
+def _set_low_priority(on: bool) -> None:
+    """BELOW_NORMAL while transcribing so browsers / games keep priority."""
+    if sys.platform != "win32":
+        return
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k32.SetPriorityClass(k32.GetCurrentProcess(), 0x4000 if on else 0x20)
+    except Exception:
+        pass
+
+
+def _segments_to_lines(segs) -> list[tuple[float, str]]:
+    """Whisper segments -> synced lines, dropping typical hallucinations."""
+    cues: list[tuple[float, float, str]] = []
+    run = 0
+    for sg in segs:
+        text = " ".join((getattr(sg, "text", "") or "").split())
+        if not text or _HALLUCINATION.search(text):
+            continue
+        nsp = getattr(sg, "no_speech_prob", 0.0) or 0.0
+        lp = getattr(sg, "avg_logprob", 0.0) or 0.0
+        if (nsp > 0.6 and lp < -1.0) or lp < -2.0:
+            continue
+        run = run + 1 if cues and cues[-1][2] == text else 0
+        if run >= 2:                                  # looping repetition
+            continue
+        cues.append((float(sg.start), float(sg.end), text))
+
+    out: list[tuple[float, str]] = []
+    for i, (start, end, text) in enumerate(cues):
+        out.append((start, text))
+        nxt = cues[i + 1][0] if i + 1 < len(cues) else None
+        if end > start and (nxt is None or nxt - end > 2.0):
+            out.append((end, ""))
+    return out
+
+
+def transcribe_youtube(vid: str, should_cancel, on_status) -> Lyrics | None:
+    """Download the audio to a temp folder, transcribe it, delete the audio."""
+    if yt_dlp is None:
+        return None
+    from faster_whisper import WhisperModel            # lazy: zero cost until needed
+
+    models_dir = Path(os.getenv("APPDATA") or Path.home()) / APP_NAME / "models"
+    with tempfile.TemporaryDirectory(prefix="autolyrics_") as tmp:
+        on_status("Downloading audio…", "AI lyrics (no captions or lyrics found)")
+        opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
+                "socket_timeout": 10,
+                "format": "bestaudio[ext=m4a]/bestaudio/best",
+                "outtmpl": os.path.join(tmp, "audio.%(ext)s")}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([f"https://www.youtube.com/watch?v={vid}"])
+        files = sorted(Path(tmp).glob("audio.*"))
+        if not files or should_cancel():
+            return None
+
+        first_run = not models_dir.exists() or not any(models_dir.iterdir())
+        on_status("Loading AI model…",
+                  "First time only: downloading ~500MB model" if first_run
+                  else "AI lyrics (no captions or lyrics found)")
+        model = WhisperModel(AI_MODEL, device="cpu", compute_type="int8",
+                             cpu_threads=AI_THREADS, download_root=str(models_dir))
+        try:
+            if should_cancel():
+                return None
+            segments, info = model.transcribe(
+                str(files[0]), language=AI_LANGUAGE, beam_size=1, vad_filter=True,
+                condition_on_previous_text=False, word_timestamps=False)
+            total = float(getattr(info, "duration", 0) or 0)
+            collected = []
+            for sg in segments:                       # generator: work happens here
+                if should_cancel():
+                    return None
+                collected.append(sg)
+                if total > 0:
+                    on_status(f"Transcribing… {min(99, int(sg.end / total * 100))}%",
+                              "AI lyrics - may contain errors")
+        finally:
+            del model
+            gc.collect()                              # give the ~1GB RAM back
+    lines = _segments_to_lines(collected)
+    if sum(1 for _, t in lines if t) < 3:
+        return None
+    return Lyrics(synced=lines, source="AI-generated · may have errors")
 
 
 class LyricsCache:
@@ -468,6 +629,7 @@ class MediaWatcher(QObject):
         super().__init__()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._sticky = ""            # app id of the session we are following
 
     def start(self) -> None:
         if MediaManager is None:
@@ -485,16 +647,29 @@ class MediaWatcher(QObject):
         except Exception as exc:  # pragma: no cover
             print("MediaWatcher stopped:", exc, file=sys.stderr)
 
-    @staticmethod
-    def _pick_session(manager):
+    def _pick_session(self, manager):
+        """Stick to one session so two players never make the lyrics flip-flop."""
         sessions = list(manager.get_sessions())
-        for s in sessions:                       # prefer something that is playing
+
+        def is_playing(sess) -> bool:
             try:
-                if s.get_playback_info().playback_status == PlaybackStatus.PLAYING:
-                    return s
+                return sess.get_playback_info().playback_status == PlaybackStatus.PLAYING
             except Exception:
-                continue
-        return manager.get_current_session()
+                return False
+
+        mine = [x for x in sessions if x.source_app_user_model_id == self._sticky]
+        if mine and is_playing(mine[0]):
+            return mine[0]
+        for sess in sessions:                    # switch only to something that is playing
+            if is_playing(sess):
+                self._sticky = sess.source_app_user_model_id
+                return sess
+        if mine:                                 # nothing playing: stay on the paused one
+            return mine[0]
+        cur = manager.get_current_session()
+        if cur is not None:
+            self._sticky = cur.source_app_user_model_id
+        return cur
 
     async def _snapshot(self, manager):
         session = self._pick_session(manager)
@@ -534,28 +709,34 @@ class MediaWatcher(QObject):
         manager = None
         last_key: tuple[str, str] | None = None
         had_media = False
-        pending = 0          # browsers often report duration a moment after the title
+        cand_key: tuple[str, str] | None = None   # a new track must stay stable 2 polls
+        cand_n = 0
+        miss = 0                                  # consecutive polls without media
         while not self._stop.is_set():
             try:
                 if manager is None:
                     manager = await MediaManager.request_async()
                 snap = await self._snapshot(manager)
                 if snap is None:
-                    if had_media:
-                        had_media, last_key = False, None
+                    miss += 1
+                    if had_media and miss >= 4:           # ignore ~1s metadata hiccups
+                        had_media, last_key, cand_key, cand_n = False, None, None, 0
                         self.no_media.emit()
                 else:
+                    miss = 0
                     title, artist, album, duration, pos, playing, app_id = snap
                     key = (title, artist)
                     if key != last_key:
-                        if duration <= 0 and pending < 6:
-                            pending += 1                  # wait up to ~1.5s for duration
-                        else:
-                            pending = 0
+                        cand_n = cand_n + 1 if key == cand_key else 1
+                        cand_key = key
+                        # stable for 2 polls; wait up to ~1.5s for the duration to appear
+                        if cand_n >= 2 and (duration > 0 or cand_n >= 6):
+                            cand_key, cand_n = None, 0
                             last_key, had_media = key, True
                             self.track_changed.emit(title, artist, album, duration, app_id)
                             self.playback.emit(pos, playing)
                     else:
+                        cand_key, cand_n = None, 0
                         self.playback.emit(pos, playing)
             except Exception as exc:
                 print("SMTC error:", exc, file=sys.stderr)
@@ -783,15 +964,18 @@ def _cursor_for(edges) -> Qt.CursorShape | None:
 
 
 class LyricsWindow(QWidget):
-    lyrics_ready = pyqtSignal(int, object, bool)   # token, Lyrics|None, network_failed
+    lyrics_ready = pyqtSignal(int, object, bool, str)   # token, Lyrics|None, net_failed, trace
     always_on_top_changed = pyqtSignal(bool)
     track_text_changed = pyqtSignal(str)
+    status_msg = pyqtSignal(int, str, str)         # token, main, sub  (AI progress)
+    ai_changed = pyqtSignal(bool)
 
     def __init__(self) -> None:
         super().__init__()
         self.settings = QSettings(APP_NAME, APP_NAME)
         self.cache = LyricsCache()
         self.always_on_top = self.settings.value("always_on_top", True, type=bool)
+        self.ai_enabled = self.settings.value("ai_enabled", True, type=bool)
 
         flags = Qt.WindowType.FramelessWindowHint
         if self.always_on_top:
@@ -809,6 +993,8 @@ class LyricsWindow(QWidget):
         self._pos_stamp = time.monotonic()
         self._playing = False
         self.offset = 0.0              # manual timing offset (s), per track
+        self._fresh = True             # next SMTC sample is accepted as-is (new track)
+        self._jump: tuple[float, float] | None = None   # unconfirmed position jump
         self._track_key = ""
         self._last_toggle = 0.0
         self._fade: QPropertyAnimation | None = None
@@ -818,6 +1004,7 @@ class LyricsWindow(QWidget):
         self.titlebar.set_pinned(self.always_on_top)
 
         self.lyrics_ready.connect(self._on_lyrics_ready)
+        self.status_msg.connect(self._on_status_msg)
         self.timer = QTimer(self)
         self.timer.setInterval(100)
         self.timer.timeout.connect(self._tick)
@@ -1098,17 +1285,42 @@ class LyricsWindow(QWidget):
                          "Play something in Spotify, YouTube, or any media app.")
 
     def on_playback(self, position: float, playing: bool) -> None:
+        """Feed SMTC positions into a local clock. Browsers sometimes report a stale
+        or zero position for a moment; such glitches are ignored, jitter is smoothed,
+        and a real seek is accepted as soon as the next poll confirms it."""
         now = time.monotonic()
         expected = self._pos_base + ((now - self._pos_stamp) if self._playing else 0.0)
-        if self.times and abs(position - expected) > SEEK_JUMP:
-            self.view.force_follow()             # user seeked: jump straight to the line
-        self._pos_base, self._pos_stamp, self._playing = position, now, playing
+        delta = position - expected
+
+        if self._fresh or playing != self._playing:          # new track / play / pause
+            self._fresh, self._jump = False, None
+            self._pos_base, self._pos_stamp, self._playing = position, now, playing
+            return
+        if abs(delta) <= SYNC_TOLERANCE:                      # normal: low-pass the jitter
+            self._jump = None
+            self._pos_base = expected + delta * SYNC_SMOOTH
+            self._pos_stamp = now
+            return
+
+        # Big difference: a seek or a glitch? Believe it only if the next poll agrees.
+        if self._jump is not None:
+            jump_pos, jump_at = self._jump
+            candidate = jump_pos + ((now - jump_at) if playing else 0.0)
+            if abs(position - candidate) <= SYNC_TOLERANCE:
+                self._jump = None
+                self._pos_base, self._pos_stamp = position, now
+                if self.times:
+                    self.view.force_follow()                  # seek: jump to the right line
+                return
+        _log(f"sync: ignored position {position:.1f}s (expected {expected:.1f}s)")
+        self._jump = (position, now)
 
     def on_track_changed(self, title: str, artist: str, album: str,
                          duration: float, app_id: str = "") -> None:
         self.token += 1
         token = self.token
         self.times = []
+        self._fresh, self._jump = True, None
         self._track_key = LyricsCache.key(title, artist)
         self.offset = float(self._load_offsets().get(self._track_key, 0.0))
         self.off_val.setText(f"{self.offset:+.1f}s" if self.offset else "0.0s")
@@ -1131,13 +1343,60 @@ class LyricsWindow(QWidget):
                          daemon=True).start()
 
     def _fetch_worker(self, token, title, artist, album, duration, app_id) -> None:
+        trace: list[str] = []
+        ctx: dict = {}
         try:
-            lyr, net_fail = fetch_best_lyrics(title, artist, album, duration, app_id)
-        except Exception:
+            lyr, net_fail = fetch_best_lyrics(title, artist, album, duration,
+                                              app_id, trace, ctx)
+        except Exception as exc:
+            _log(f"fetch error for {artist} - {title}: {exc!r}")
             lyr, net_fail = None, True
-        self.lyrics_ready.emit(token, lyr, net_fail)
+        if lyr is None and not net_fail and self.ai_enabled and ctx.get("vid"):
+            lyr = self._run_ai(token, ctx["vid"], duration, trace)
+        _log(f"{artist} - {title} [{duration:.0f}s, {app_id}] -> "
+             f"{lyr.source if lyr else 'NONE'} | {' | '.join(trace)}")
+        self.lyrics_ready.emit(token, lyr, net_fail, " · ".join(trace))
 
-    def _on_lyrics_ready(self, token: int, lyr, net_fail: bool) -> None:
+    def _run_ai(self, token: int, vid: str, duration: float, trace: list[str]):
+        if duration > AI_MAX_SECONDS:
+            trace.append("AI: video too long")
+            return None
+        if not _ai_lock.acquire(blocking=False):
+            trace.append("AI: busy with another song")
+            return None
+        _set_low_priority(True)
+        try:
+            lyr = transcribe_youtube(
+                vid,
+                should_cancel=lambda: token != self.token,
+                on_status=lambda m, sub="": self.status_msg.emit(token, m, sub))
+            if lyr is None and token == self.token:
+                trace.append("AI: no clear vocals detected")
+            return lyr
+        except ImportError:
+            trace.append("AI: faster-whisper not installed")
+        except Exception as exc:
+            trace.append(f"AI: error ({type(exc).__name__})")
+            _log(f"AI error for {vid}: {exc!r}")
+        finally:
+            _set_low_priority(False)
+            _ai_lock.release()
+        return None
+
+    def _on_status_msg(self, token: int, main: str, sub: str) -> None:
+        # progress text only - no fade, and never replaces already shown lyrics
+        if token != self.token or self.stack.currentIndex() != 0:
+            return
+        self.status_main.setText(main)
+        self.status_sub.setText(sub)
+        self.status_sub.setVisible(bool(sub))
+
+    def toggle_ai(self) -> None:
+        self.ai_enabled = not self.ai_enabled
+        self.settings.setValue("ai_enabled", self.ai_enabled)
+        self.ai_changed.emit(self.ai_enabled)
+
+    def _on_lyrics_ready(self, token: int, lyr, net_fail: bool, trace: str = "") -> None:
         if token != self.token:
             return                              # stale result for an older track
         title, artist = self.track_label._full, self.artist_label._full
@@ -1146,8 +1405,9 @@ class LyricsWindow(QWidget):
             if net_fail:
                 self.show_status("Couldn't reach LRCLIB", "Check your internet connection.")
             else:
+                head = f"{artist} – {title}" if artist else title
                 self.show_status("No lyrics found",
-                                 f"{artist} – {title}" if artist else title)
+                                 f"{head}\n{trace}" if trace else head)
             return
         self.cache.put(title, artist, lyr)
         self._apply_lyrics(lyr, title, artist)
@@ -1205,6 +1465,7 @@ class TrayBridge(QObject):
     """pystray runs in its own thread; these signals hop back to the Qt thread."""
     toggle = pyqtSignal()
     toggle_aot = pyqtSignal()
+    toggle_ai = pyqtSignal()
     quit = pyqtSignal()
 
 
@@ -1215,6 +1476,9 @@ def main() -> int:
     if sys.platform != "win32":
         print("AutoLyrics only runs on Windows (SMTC is a Windows API).")
         return 1
+    for stream in ("stdout", "stderr"):          # windowed exe: libs that write here would crash
+        if getattr(sys, stream) is None:
+            setattr(sys, stream, open(os.devnull, "w"))
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("AutoLyrics.App")
     except Exception:
@@ -1237,18 +1501,22 @@ def main() -> int:
     bridge = TrayBridge()
     bridge.toggle.connect(win.toggle_visibility)
     bridge.toggle_aot.connect(win.toggle_always_on_top)
+    bridge.toggle_ai.connect(win.toggle_ai)
 
     menu = pystray.Menu(
         pystray.MenuItem("Show/Hide Lyrics", lambda icon, item: bridge.toggle.emit(),
                          default=True),                  # default = left-click action
         pystray.MenuItem("Always on Top", lambda icon, item: bridge.toggle_aot.emit(),
                          checked=lambda item: win.always_on_top),
+        pystray.MenuItem("AI lyrics (last resort)", lambda icon, item: bridge.toggle_ai.emit(),
+                         checked=lambda item: win.ai_enabled),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Exit", lambda icon, item: bridge.quit.emit()),
     )
     tray = pystray.Icon(APP_NAME, make_icon_image(64), APP_NAME, menu)
 
     win.always_on_top_changed.connect(lambda _on: tray.update_menu())
+    win.ai_changed.connect(lambda _on: tray.update_menu())
 
     def update_tooltip(text: str) -> None:
         try:
