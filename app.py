@@ -89,7 +89,7 @@ except Exception:  # pragma: no cover - CC layer simply gets skipped
     yt_dlp = None
 
 APP_NAME = "AutoLyrics"
-APP_VERSION = "1.3.6"
+APP_VERSION = "1.3.7"
 LRCLIB_API = "https://lrclib.net/api"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (https://github.com/your-name/AutoLyrics)"
 
@@ -110,6 +110,7 @@ AI_MAX_SECONDS = 900      # skip videos longer than this (15 min)
 AI_LANGUAGE = None        # None = auto-detect; or force e.g. "tl" (Tagalog), "en"
 
 # YouTube Closed Captions layer
+AUTO_CC_LANGS = ("tl", "en")   # auto-CC detected as anything else (e.g. "id" for Tagalog) is junk
 ALLOW_AUTO_CC = True     # last-resort synced source: YouTube auto-generated captions
 # Caption language order when a video has several tracks (first match wins).
 # Filipino first: English tracks on OPM videos are usually translations.
@@ -467,6 +468,9 @@ def fetch_youtube_cc(title: str, artist: str, duration: float, trace: list[str],
         if not picked:
             return None
         lang, track = picked
+        if strict and _base_lang(lang) not in AUTO_CC_LANGS:
+            trace.append(f"Captions: auto-CC skipped (detected '{lang}')")
+            return None
         r = requests.get(track["url"], timeout=8,
                          headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
@@ -1341,7 +1345,7 @@ class LyricsWindow(QWidget):
     def on_playback(self, position: float, playing: bool,
                     duration: float = 0.0, age: float = 0.0) -> None:
         """Feed SMTC samples into a local clock that survives bad data:
-        * an EMPTY timeline (duration 0, position 0) in the middle of a track - some
+        * an EMPTY timeline (duration 0, position 0) at any point of a track - some
           browsers drop the timeline halfway through - is ignored and the local clock
           keeps running until a real timeline comes back;
         * ads / other media (much shorter duration) freeze the lyrics, and the song
@@ -1353,8 +1357,12 @@ class LyricsWindow(QWidget):
         expected = self._pos_base + ((now - self._pos_stamp) if self._playing else 0.0)
         self._track_dur = max(self._track_dur, duration)
 
-        # 0) timeline lost: no duration although this track had one -> position is junk
-        if duration <= 0 and self._track_dur > 0:
+        # 0) EMPTY timeline: no duration and a raw position of ~0. Its "position" is only the
+        #    time since the browser last wrote that empty timeline, and that restarts
+        #    mid-song - so after the first sample of a track never trust it.
+        raw = position - (age if playing else 0.0)
+        empty = duration <= 0 and raw < 1.0
+        if empty and not self._fresh:
             if not self._lost:
                 self._lost, self._jump = True, None
                 _log(f"sync: SMTC timeline empty at clock {expected:.1f}s "
@@ -1362,7 +1370,7 @@ class LyricsWindow(QWidget):
             if playing != self._playing:                    # still honour play / pause
                 self._pos_base, self._pos_stamp, self._playing = expected, now, playing
             return
-        if self._lost:
+        if self._lost and not empty:
             self._lost, self._jump = False, None
             _log(f"sync: SMTC timeline is back (reports {position:.1f}s, "
                  f"clock {expected:.1f}s)")
