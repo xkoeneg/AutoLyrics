@@ -57,12 +57,19 @@ itself (about 0.15 s) and locks onto the real position instantly.
 
 Requires Windows 10/11 and Python 3.11 or 3.12.
 
+## Taskbar icon
+The icon is embedded in `AutoLyrics.exe` (`assets/icon.ico`, built with `--icon`), so pinning
+looks right. Put the `AutoLyrics` folder somewhere permanent first (e.g. `C:\Apps\AutoLyrics`),
+then right-click `AutoLyrics.exe` > **Pin to taskbar**. If an old icon sticks, unpin, run
+`ie4uinit.exe -show` in a terminal, and pin again. Edit the design in `make_icon_image`
+(app.py) and run `python tools/make_icon.py` to regenerate the files.
+
 ## Build
 Push a version tag and GitHub Actions attaches `AutoLyrics-windows.zip` to a Release
 (extract it and run `AutoLyrics\AutoLyrics.exe`):
 
-    git tag v1.4.0
-    git push origin v1.4.0
+    git tag v1.4.1
+    git push origin v1.4.1
 
 ## Usage
 - Tray icon click: show/hide. Right-click: Show/Hide, Always on Top, Exit.

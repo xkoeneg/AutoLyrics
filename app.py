@@ -19,6 +19,7 @@ import bisect
 import ctypes
 import gc
 import json
+import math
 import operator
 import os
 import re
@@ -33,7 +34,7 @@ from pathlib import Path
 
 import pystray
 import requests
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 from PyQt6.QtCore import (
     QEasingCurve,
     QObject,
@@ -90,7 +91,7 @@ except Exception:  # pragma: no cover - CC layer simply gets skipped
     yt_dlp = None
 
 APP_NAME = "AutoLyrics"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 LRCLIB_API = "https://lrclib.net/api"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (https://github.com/your-name/AutoLyrics)"
 
@@ -1730,16 +1731,75 @@ class LyricsWindow(QWidget):
 # Tray icon
 # ----------------------------------------------------------------------------
 def make_icon_image(size: int = 64) -> Image.Image:
-    s = size / 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    """AutoLyrics icon: dark squircle, glowing blue gradient note, lyric lines.
+    Small sizes (< 40 px) use a bolder note and drop the lyric lines for legibility."""
+    R = 1024                                   # supersampled canvas
+    u = R / 256
+    full = size >= 40
+    k, dy = (0.92, -14) if full else (1.2, 2)  # note scale / vertical shift
+    stem_w = 12 if full else 17
+    beam_t = 30 if full else 38
+
+    def T(x: float, y: float) -> tuple[float, float]:
+        return ((128 + (x - 128) * k) * u, (128 + (y - 128) * k + dy) * u)
+
+    # --- the note (mask) ------------------------------------------------
+    note = Image.new("L", (R, R), 0)
+    nd = ImageDraw.Draw(note)
+    heads = [(88, 172), (168, 152)]
+    for hx, hy in heads:                       # tilted oval heads
+        pts = []
+        for i in range(72):
+            a = i / 72 * 2 * math.pi
+            ex, ey = 30 * math.cos(a), 23 * math.sin(a)
+            th = math.radians(-24)
+            pts.append(T(hx + ex * math.cos(th) - ey * math.sin(th),
+                         hy + ex * math.sin(th) + ey * math.cos(th)))
+        nd.polygon(pts, fill=255)
+    tops = [78, 58]                            # beam top edge at each stem
+    stem_tops = [82, 66]                       # stems end inside the beam (no bump)
+    for (hx, hy), top in zip(heads, stem_tops):     # stems
+        x0 = hx + 29 - stem_w
+        nd.polygon([T(x0, top), T(hx + 29, top), T(hx + 29, hy), T(x0, hy)], fill=255)
+    x0, x1 = heads[0][0] + 29 - stem_w, heads[1][0] + 29   # beam joining the stems
+    nd.polygon([T(x0, tops[0]), T(x1, tops[1]), T(x1, tops[1] + beam_t),
+                T(x0, tops[0] + beam_t)], fill=255)
+
+    # --- background squircle -------------------------------------------------
+    inset = 6 * u
+    bg_mask = Image.new("L", (R, R), 0)
+    ImageDraw.Draw(bg_mask).rounded_rectangle((inset, inset, R - inset, R - inset),
+                                              radius=R * 0.225, fill=255)
+    vgrad = Image.linear_gradient("L").resize((R, R))
+    bg = Image.composite(Image.new("RGBA", (R, R), (11, 14, 22, 255)),
+                         Image.new("RGBA", (R, R), (34, 42, 62, 255)), vgrad)
+    img = Image.new("RGBA", (R, R), (0, 0, 0, 0))
+    img.paste(bg, (0, 0), bg_mask)
+
+    # --- glow + gradient note ------------------------------------------------------
+    glow = note.filter(ImageFilter.GaussianBlur(R * 0.035))
+    glow_rgba = Image.new("RGBA", (R, R), (80, 190, 255, 0))
+    glow_rgba.putalpha(glow.point(lambda v: int(v * 0.55)))
+    img = Image.alpha_composite(img, Image.composite(glow_rgba, Image.new("RGBA", (R, R)), bg_mask))
+    note_fill = Image.composite(Image.new("RGBA", (R, R), (52, 150, 255, 255)),
+                                Image.new("RGBA", (R, R), (150, 236, 255, 255)), vgrad)
+    img.paste(note_fill, (0, 0), note)
+
+    # --- lyric lines (big sizes only): one lit, one dim ------------------------------
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle((0, 0, size - 1, size - 1), radius=size * 0.22, fill=(32, 32, 36, 255))
-    accent = (96, 205, 255, 255)
-    d.ellipse((16 * s, 38 * s, 32 * s, 52 * s), fill=accent)          # note head
-    d.rectangle((29 * s, 14 * s, 33 * s, 46 * s), fill=accent)         # stem
-    d.polygon([(33 * s, 14 * s), (48 * s, 20 * s), (48 * s, 28 * s), (33 * s, 22 * s)],
-              fill=accent)                                             # flag
-    return img
+    if full:
+        d.rounded_rectangle((62 * u, 194 * u, 194 * u, 206 * u), radius=6 * u,
+                            fill=(96, 205, 255, 255))
+        d.rounded_rectangle((90 * u, 216 * u, 166 * u, 226 * u), radius=5 * u,
+                            fill=(255, 255, 255, 62))
+
+    # --- soft inner rim -----------------------------------------------------------------
+    rim = Image.new("RGBA", (R, R), (0, 0, 0, 0))
+    ImageDraw.Draw(rim).rounded_rectangle((inset, inset, R - inset, R - inset),
+                                          radius=R * 0.225, outline=(255, 255, 255, 34),
+                                          width=int(2.5 * u))
+    img = Image.alpha_composite(img, rim)
+    return img.resize((size, size), Image.Resampling.LANCZOS)
 
 
 def pil_to_pixmap(img: Image.Image) -> QPixmap:
@@ -1768,16 +1828,23 @@ def main() -> int:
     for stream in ("stdout", "stderr"):          # windowed exe: libs that write here would crash
         if getattr(sys, stream) is None:
             setattr(sys, stream, open(os.devnull, "w"))
-    try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("AutoLyrics.App")
-    except Exception:
-        pass
+    if not getattr(sys, "frozen", False):
+        # From source we run inside python.exe, so give the taskbar our own identity.
+        # In the packaged exe we deliberately do NOT: a pinned shortcut and the running
+        # window must share the default (exe-path) id, or Windows shows two icons.
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("AutoLyrics.App")
+        except Exception:
+            pass
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)
     app.setFont(QFont("Segoe UI", 10))
-    app.setWindowIcon(QIcon(pil_to_pixmap(make_icon_image(128))))
+    icon = QIcon()
+    for px in (16, 20, 24, 32, 40, 48, 64, 128, 256):      # Windows picks the crispest one
+        icon.addPixmap(pil_to_pixmap(make_icon_image(px)))
+    app.setWindowIcon(icon)
 
     win = LyricsWindow()
     watcher = MediaWatcher()
@@ -1808,7 +1875,11 @@ def main() -> int:
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Exit", lambda icon, item: bridge.quit.emit()),
     )
-    tray = pystray.Icon(APP_NAME, make_icon_image(64), APP_NAME, menu)
+    try:
+        tray_px = ctypes.windll.user32.GetSystemMetrics(49) or 32     # SM_CXSMICON
+    except Exception:
+        tray_px = 32
+    tray = pystray.Icon(APP_NAME, make_icon_image(tray_px), APP_NAME, menu)
 
     win.always_on_top_changed.connect(lambda _on: tray.update_menu())
     win.ai_changed.connect(lambda _on: tray.update_menu())
