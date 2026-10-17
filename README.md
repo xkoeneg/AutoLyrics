@@ -23,6 +23,19 @@ window that lives in the system tray.
 The footer shows which source is active. When nothing is found, the window lists which
 layers missed, and details are written to `%APPDATA%\AutoLyrics\debug.log`.
 
+## Synced / Plain
+The footer has **Synced** and **Plain** buttons. Plain shows the whole lyric sheet (derived from
+the timed lines when a source has no plain text) and you scroll it yourself. Your choice is
+remembered; a song that only has one version simply shows that one.
+
+## Sync accuracy
+Some browsers (notably Firefox) only publish a real playback position after a pause/play.
+If the app is opened mid-song, or the position looks wrong, AutoLyrics now does that pause/play
+itself (about 0.15 s) and locks onto the real position instantly.
+- **Auto re-sync** runs only when the timeline is empty and the song is already in progress
+  (max. twice per track). Turn it off in the tray menu (*Auto re-sync*).
+- **Sync** button: do it yourself at any time, e.g. after seeking in the video.
+
 ## Timing
 - Lyrics follow the real SMTC timeline, so seeking, pausing and resuming re-sync
   automatically.
@@ -48,8 +61,8 @@ Requires Windows 10/11 and Python 3.11 or 3.12.
 Push a version tag and GitHub Actions attaches `AutoLyrics-windows.zip` to a Release
 (extract it and run `AutoLyrics\AutoLyrics.exe`):
 
-    git tag v1.3.7
-    git push origin v1.3.7
+    git tag v1.4.0
+    git push origin v1.4.0
 
 ## Usage
 - Tray icon click: show/hide. Right-click: Show/Hide, Always on Top, Exit.

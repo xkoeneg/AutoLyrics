@@ -58,6 +58,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QFrame,
     QGraphicsOpacityEffect,
     QHBoxLayout,
@@ -89,7 +90,7 @@ except Exception:  # pragma: no cover - CC layer simply gets skipped
     yt_dlp = None
 
 APP_NAME = "AutoLyrics"
-APP_VERSION = "1.3.7"
+APP_VERSION = "1.4.0"
 LRCLIB_API = "https://lrclib.net/api"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (https://github.com/your-name/AutoLyrics)"
 
@@ -614,6 +615,32 @@ def transcribe_youtube(vid: str, should_cancel, on_status) -> Lyrics | None:
     return Lyrics(synced=lines, source="AI-generated · may have errors")
 
 
+def plain_from_synced(synced: list[tuple[float, str]]) -> str:
+    """Timed lines -> plain text (gaps become blank lines between stanzas)."""
+    out: list[str] = []
+    for _, text in synced:
+        text = text.strip()
+        if text:
+            out.append(text)
+        elif out and out[-1] != "":
+            out.append("")
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
+
+
+def choose_view(lyr: Lyrics, mode: str) -> tuple[str, str]:
+    """-> ('synced' | 'plain' | 'none', plain_text). The user's preference only
+    matters when both versions exist."""
+    plain = lyr.plain if lyr.plain.strip() else plain_from_synced(lyr.synced)
+    has_sync, has_plain = bool(lyr.synced), bool(plain.strip())
+    if has_sync and (mode != "plain" or not has_plain):
+        return "synced", plain
+    if has_plain:
+        return "plain", plain
+    return "none", plain
+
+
 class LyricsCache:
     """Tiny JSON cache in %APPDATA%/AutoLyrics so replays are instant/offline."""
     MAX = 300
@@ -662,6 +689,7 @@ class MediaWatcher(QObject):
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._sticky = ""            # app id of the session we are following
+        self._resync = threading.Event()   # set from the UI thread: "nudge the session"
         self._last_raw: tuple[float, float, str] | None = None   # for jump logging
 
     def start(self) -> None:
@@ -754,6 +782,24 @@ class MediaWatcher(QObject):
                      f"(raw {raw:.1f}s, age {age:.1f}s, dur {duration:.0f}s, "
                      f"playing={playing})")
 
+    def request_resync(self) -> None:
+        """Thread-safe: ask the watcher loop to pause + play the session once."""
+        self._resync.set()
+
+    async def _nudge(self, manager) -> None:
+        """Browsers publish a fresh, REAL timeline when their playback state changes -
+        exactly what pressing pause/play by hand does. We do it for you (~0.15 s)."""
+        try:
+            sess = self._pick_session(manager)
+            if sess is None or sess.get_playback_info().playback_status != PlaybackStatus.PLAYING:
+                return
+            _log("resync: pause/play nudge sent")
+            await sess.try_pause_async()
+            await asyncio.sleep(0.15)
+            await sess.try_play_async()
+        except Exception as exc:
+            _log(f"resync failed: {exc!r}")
+
     async def _loop(self) -> None:
         manager = None
         last_key: tuple[str, str] | None = None
@@ -765,6 +811,9 @@ class MediaWatcher(QObject):
             try:
                 if manager is None:
                     manager = await MediaManager.request_async()
+                if self._resync.is_set():
+                    self._resync.clear()
+                    await self._nudge(manager)
                 snap = await self._snapshot(manager)
                 if snap is None:
                     miss += 1
@@ -1018,6 +1067,8 @@ class LyricsWindow(QWidget):
     track_text_changed = pyqtSignal(str)
     status_msg = pyqtSignal(int, str, str)         # token, main, sub  (AI progress)
     ai_changed = pyqtSignal(bool)
+    resync_requested = pyqtSignal()
+    auto_resync_changed = pyqtSignal(bool)
 
     def __init__(self) -> None:
         super().__init__()
@@ -1025,6 +1076,11 @@ class LyricsWindow(QWidget):
         self.cache = LyricsCache()
         self.always_on_top = self.settings.value("always_on_top", True, type=bool)
         self.ai_enabled = self.settings.value("ai_enabled", True, type=bool)
+        self.auto_resync = self.settings.value("auto_resync", True, type=bool)
+        self.view_mode = self.settings.value("view_mode", "synced", type=str)
+        self.lyrics: Lyrics | None = None
+        self._lyrics_head = ""
+        self._source_text = ""
 
         flags = Qt.WindowType.FramelessWindowHint
         if self.always_on_top:
@@ -1047,6 +1103,9 @@ class LyricsWindow(QWidget):
         self._track_dur = 0.0          # longest duration seen for this track
         self._last_idx = -1            # last highlighted line (rewind diagnostics)
         self._lost = False             # SMTC timeline went empty mid-track
+        self._anchored = False         # a REAL timeline (with duration) was seen this track
+        self._nudges = 0               # automatic re-sync attempts for this track
+        self._nudged_at = 0.0
         self._anomaly = False          # SMTC shows other media (an ad?) -> lyrics frozen
         self._anomaly_at = 0.0
         self._stale = False            # after an ad: ignore the old timeline until refreshed
@@ -1125,7 +1184,7 @@ class LyricsWindow(QWidget):
         self.stack.addWidget(self.view)
         root.addWidget(self.stack, 1)
 
-        # footer: lyric source + manual timing offset
+        # footer: source + re-sync, view mode (synced | plain), manual timing offset
         self.footer = QWidget()
         self.footer.setCursor(Qt.CursorShape.ArrowCursor)
         self.footer.setStyleSheet("""
@@ -1134,16 +1193,44 @@ class LyricsWindow(QWidget):
                 color:rgba(255,255,255,215);font-size:11px;font-weight:600;padding:4px 9px;}
             QPushButton:hover{background:rgba(255,255,255,40);}
             QPushButton:pressed{background:rgba(96,205,255,70);}
+            QPushButton:checked{background:rgba(96,205,255,80);color:#ffffff;}
+            QPushButton:disabled{background:rgba(255,255,255,8);color:rgba(255,255,255,70);}
             QPushButton#offval{background:transparent;color:%s;min-width:44px;}
             QPushButton#offval:hover{background:rgba(255,255,255,18);}
         """ % ACCENT)
-        f_lay = QHBoxLayout(self.footer)
+        f_lay = QVBoxLayout(self.footer)
         f_lay.setContentsMargins(16, 2, 12, 10)
-        f_lay.setSpacing(4)
+        f_lay.setSpacing(6)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(4)
         self.source_label = QLabel()
         self.source_label.setObjectName("source")
-        f_lay.addWidget(self.source_label)
-        f_lay.addStretch()
+        row1.addWidget(self.source_label)
+        row1.addStretch()
+        self.sync_btn = QPushButton("\u27f3 Sync")
+        self.sync_btn.setToolTip("Re-sync timing now (briefly pauses and resumes the video)")
+        self.sync_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.sync_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sync_btn.clicked.connect(self.manual_resync)
+        row1.addWidget(self.sync_btn)
+        f_lay.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(4)
+        self.mode_synced = QPushButton("Synced")
+        self.mode_plain = QPushButton("Plain")
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        for b in (self.mode_synced, self.mode_plain):
+            b.setCheckable(True)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._mode_group.addButton(b)
+            row2.addWidget(b)
+        self.mode_synced.clicked.connect(lambda: self.set_view_mode("synced"))
+        self.mode_plain.clicked.connect(lambda: self.set_view_mode("plain"))
+        row2.addStretch()
 
         self.offset_box = QWidget()
         o_lay = QHBoxLayout(self.offset_box)
@@ -1163,7 +1250,9 @@ class LyricsWindow(QWidget):
         self.off_minus.clicked.connect(lambda: self.nudge_offset(-OFFSET_STEP))
         self.off_plus.clicked.connect(lambda: self.nudge_offset(+OFFSET_STEP))
         self.off_val.clicked.connect(lambda: self.set_offset(0.0))
-        f_lay.addWidget(self.offset_box)
+        row2.addWidget(self.offset_box)
+        f_lay.addLayout(row2)
+
         root.addWidget(self.footer)
         self.footer.hide()
 
@@ -1320,6 +1409,7 @@ class LyricsWindow(QWidget):
         self._fade_in()
 
     def show_lyrics_view(self, source: str = "", synced: bool = False) -> None:
+        self._source_text = source
         self.source_label.setText(source)
         self.offset_box.setVisible(synced)       # offset is meaningless for plain text
         self.footer.show()
@@ -1336,6 +1426,7 @@ class LyricsWindow(QWidget):
         self.token += 1
         self.times = []
         self._track_key, self._last_idx = "", -1
+        self._anchored, self._nudges, self.lyrics = False, 0, None
         _log("media: nothing playing")
         self.info.hide()
         self.track_text_changed.emit("")
@@ -1362,6 +1453,16 @@ class LyricsWindow(QWidget):
         #    mid-song - so after the first sample of a track never trust it.
         raw = position - (age if playing else 0.0)
         empty = duration <= 0 and raw < 1.0
+
+        # Empty timeline while (probably) mid-song, and we never got a real one: ask for a
+        # pause/play nudge so the browser publishes the true position. At most twice.
+        if (empty and not self._anchored and playing and self.auto_resync
+                and position > 5.0 and self._nudges < 2 and now - self._nudged_at > 8.0):
+            self._nudges += 1
+            self._nudged_at = now
+            _log(f"sync: no real timeline at {position:.1f}s - requesting re-sync")
+            self.resync_requested.emit()
+
         if empty and not self._fresh:
             if not self._lost:
                 self._lost, self._jump = True, None
@@ -1393,6 +1494,20 @@ class LyricsWindow(QWidget):
             self._anomaly, self._stale, self._anomaly_end = False, True, now
             self._pos_base, self._pos_stamp, self._playing = expected, now, playing
             _log(f"sync: back to the song - resumed from {expected:.1f}s")
+            return
+
+        # 1b) first REAL timeline of this track (e.g. right after a re-sync nudge): trust it
+        #     immediately, no waiting for confirmation - this is the "mid-song start" fix.
+        if (duration > 0 and not self._anchored
+                and (raw >= 1.0 or expected < 5.0 or not playing)):
+            self._anchored = True
+            self._fresh = self._stale = False
+            self._jump = None
+            _log(f"sync: anchored to the real timeline at {position:.1f}s "
+                 f"(clock was {expected:.1f}s)")
+            self._pos_base, self._pos_stamp, self._playing = position, now, playing
+            if self.times and abs(position - expected) > 1.0:
+                self.view.force_follow()
             return
 
         # 2) new track / play / pause: take the sample as it is
@@ -1449,6 +1564,8 @@ class LyricsWindow(QWidget):
         self._fresh, self._jump = True, None
         self._track_dur, self._anomaly, self._stale = duration, False, False
         self._lost = False
+        self._anchored, self._nudges, self._nudged_at = False, 0, 0.0
+        self.lyrics = None
         self._track_key = LyricsCache.key(title, artist)
         self.offset = float(self._load_offsets().get(self._track_key, 0.0))
         self.off_val.setText(f"{self.offset:+.1f}s" if self.offset else "0.0s")
@@ -1542,19 +1659,54 @@ class LyricsWindow(QWidget):
 
     def _apply_lyrics(self, lyr: Lyrics, title: str, artist: str) -> None:
         self._last_idx = -1
+        self.lyrics = lyr
+        self._lyrics_head = f"{artist} – {title}" if artist else title
         _log(f"ui: lyrics applied ({lyr.source or 'cached'}, {len(lyr.synced)} lines) "
              f"at clock {self._pos_base:.1f}s")
-        if lyr.synced:
+        self._render_lyrics()
+
+    def _render_lyrics(self) -> None:
+        """Show the synced or the plain version, depending on what exists and on the
+        Synced / Plain buttons."""
+        lyr = self.lyrics
+        if lyr is None:
+            return
+        kind, plain = choose_view(lyr, self.view_mode)
+        self._last_idx = -1
+        self.mode_synced.setEnabled(bool(lyr.synced))
+        self.mode_plain.setEnabled(bool(plain.strip()))
+        (self.mode_plain if kind == "plain" else self.mode_synced).setChecked(True)
+        source = lyr.source or "Cached"
+        if kind == "synced":
             self.times = [t for t, _ in lyr.synced]
-            self.view.set_lines([s for _, s in lyr.synced], synced=True)
-            self.show_lyrics_view(lyr.source or "Cached", synced=True)
-        elif lyr.plain:
+            self.view.set_lines([s_ for _, s_ in lyr.synced], synced=True)
+            self.show_lyrics_view(source, synced=True)
+        elif kind == "plain":
             self.times = []
-            self.view.set_lines(lyr.plain.splitlines(), synced=False)
-            self.show_lyrics_view(lyr.source or "LRCLIB · plain", synced=False)
+            self.view.set_lines(plain.splitlines(), synced=False)
+            self.show_lyrics_view(source, synced=False)
         else:
             self.times = []
-            self.show_status("Instrumental", f"{artist} – {title}" if artist else title)
+            self.show_status("Instrumental", self._lyrics_head)
+
+    def set_view_mode(self, mode: str) -> None:
+        self.view_mode = mode
+        self.settings.setValue("view_mode", mode)
+        self._render_lyrics()
+
+    # -- re-sync -----------------------------------------------------------------
+    def manual_resync(self) -> None:
+        """The Sync button: accept the next real timeline instantly and nudge the player."""
+        self._anchored = False
+        self._nudges = 0
+        self.resync_requested.emit()
+        self.source_label.setText("Syncing…")
+        QTimer.singleShot(1800, lambda: self.source_label.setText(self._source_text))
+
+    def toggle_auto_resync(self) -> None:
+        self.auto_resync = not self.auto_resync
+        self.settings.setValue("auto_resync", self.auto_resync)
+        self.auto_resync_changed.emit(self.auto_resync)
 
     # -- sync tick ---------------------------------------------------------
     def _tick(self) -> None:
@@ -1602,6 +1754,7 @@ class TrayBridge(QObject):
     toggle = pyqtSignal()
     toggle_aot = pyqtSignal()
     toggle_ai = pyqtSignal()
+    toggle_resync = pyqtSignal()
     quit = pyqtSignal()
 
 
@@ -1638,6 +1791,8 @@ def main() -> int:
     bridge.toggle.connect(win.toggle_visibility)
     bridge.toggle_aot.connect(win.toggle_always_on_top)
     bridge.toggle_ai.connect(win.toggle_ai)
+    bridge.toggle_resync.connect(win.toggle_auto_resync)
+    win.resync_requested.connect(watcher.request_resync)
 
     menu = pystray.Menu(
         pystray.MenuItem("Show/Hide Lyrics", lambda icon, item: bridge.toggle.emit(),
@@ -1646,6 +1801,9 @@ def main() -> int:
                          checked=lambda item: win.always_on_top),
         pystray.MenuItem("AI lyrics (last resort)", lambda icon, item: bridge.toggle_ai.emit(),
                          checked=lambda item: win.ai_enabled),
+        pystray.MenuItem("Auto re-sync (brief pause/play)",
+                         lambda icon, item: bridge.toggle_resync.emit(),
+                         checked=lambda item: win.auto_resync),
         pystray.MenuItem("Open debug log", lambda icon, item: _open_log()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Exit", lambda icon, item: bridge.quit.emit()),
@@ -1654,6 +1812,7 @@ def main() -> int:
 
     win.always_on_top_changed.connect(lambda _on: tray.update_menu())
     win.ai_changed.connect(lambda _on: tray.update_menu())
+    win.auto_resync_changed.connect(lambda _on: tray.update_menu())
 
     def update_tooltip(text: str) -> None:
         try:
