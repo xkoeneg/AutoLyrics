@@ -30,11 +30,15 @@ remembered; a song that only has one version simply shows that one.
 
 ## Sync accuracy
 Some browsers (notably Firefox) only publish a real playback position after a pause/play.
-If the app is opened mid-song, or the position looks wrong, AutoLyrics now does that pause/play
-itself (about 0.15 s) and locks onto the real position instantly.
-- **Auto re-sync** runs only when the timeline is empty and the song is already in progress
-  (max. twice per track). Turn it off in the tray menu (*Auto re-sync*).
-- **Sync** button: do it yourself at any time, e.g. after seeking in the video.
+AutoLyrics watches for the player writing a new timeline and re-syncs by itself:
+- **Seeking forward / backward** is detected automatically. A real timeline is followed at once;
+  an empty one triggers a quick pause/play (about 0.15 s) that makes the browser publish the true
+  position. Dragging the progress bar causes only one re-sync, after you let go.
+- **Opening the app mid-song** does the same on the first sample.
+- Safety limits: nudges are at least 2.5 s apart, max. 3 per minute, and back off to 20 s if a
+  browser never gives a real timeline.
+- The **Sync** button does it on demand. Turn the automatic part off in the tray menu
+  (*Auto re-sync*).
 
 ## Timing
 - Lyrics follow the real SMTC timeline, so seeking, pausing and resuming re-sync
@@ -68,8 +72,8 @@ then right-click `AutoLyrics.exe` > **Pin to taskbar**. If an old icon sticks, u
 Push a version tag and GitHub Actions attaches `AutoLyrics-windows.zip` to a Release
 (extract it and run `AutoLyrics\AutoLyrics.exe`):
 
-    git tag v1.4.1
-    git push origin v1.4.1
+    git tag v1.4.2
+    git push origin v1.4.2
 
 ## Usage
 - Tray icon click: show/hide. Right-click: Show/Hide, Always on Top, Exit.

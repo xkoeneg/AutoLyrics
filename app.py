@@ -91,7 +91,7 @@ except Exception:  # pragma: no cover - CC layer simply gets skipped
     yt_dlp = None
 
 APP_NAME = "AutoLyrics"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 LRCLIB_API = "https://lrclib.net/api"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (https://github.com/your-name/AutoLyrics)"
 
@@ -682,7 +682,7 @@ class LyricsCache:
 class MediaWatcher(QObject):
     track_changed = pyqtSignal(str, str, str, float, str)   # title, artist, album, duration, app_id
     no_media = pyqtSignal()
-    playback = pyqtSignal(float, bool, float, float)   # position, is_playing, duration, age
+    playback = pyqtSignal(float, bool, float, float, bool)   # pos, playing, duration, age, written
     unavailable = pyqtSignal()
 
     def __init__(self) -> None:
@@ -692,6 +692,7 @@ class MediaWatcher(QObject):
         self._sticky = ""            # app id of the session we are following
         self._resync = threading.Event()   # set from the UI thread: "nudge the session"
         self._last_raw: tuple[float, float, str] | None = None   # for jump logging
+        self._last_upd = None        # last_updated_time of the previous poll
 
     def start(self) -> None:
         if MediaManager is None:
@@ -751,7 +752,7 @@ class MediaWatcher(QObject):
         except Exception:
             rate = 1.0
 
-        position, duration, age = 0.0, 0.0, 0.0
+        position, duration, age, written = 0.0, 0.0, 0.0, False
         try:
             tl = session.get_timeline_properties()
             position = tl.position.total_seconds()
@@ -762,6 +763,9 @@ class MediaWatcher(QObject):
                 if updated.tzinfo is None:
                     updated = updated.replace(tzinfo=timezone.utc)
                 age = max(0.0, (datetime.now(timezone.utc) - updated).total_seconds())
+                # the player wrote a NEW timeline since the last poll (seek, pause, ...)
+                written = self._last_upd is not None and updated != self._last_upd
+                self._last_upd = updated
                 if playing:
                     position += age * rate
             if duration > 0:
@@ -769,7 +773,7 @@ class MediaWatcher(QObject):
             self._note_jump(title, raw, position, duration, age, playing)
         except Exception:
             pass
-        return title, artist, album, duration, position, playing, app_id, age
+        return title, artist, album, duration, position, playing, app_id, age, written
 
     def _note_jump(self, title: str, raw: float, position: float, duration: float,
                    age: float, playing: bool) -> None:
@@ -823,7 +827,7 @@ class MediaWatcher(QObject):
                         self.no_media.emit()
                 else:
                     miss = 0
-                    title, artist, album, duration, pos, playing, app_id, age = snap
+                    title, artist, album, duration, pos, playing, app_id, age, written = snap
                     key = (title, artist)
                     if key != last_key:
                         cand_n = cand_n + 1 if key == cand_key else 1
@@ -833,10 +837,10 @@ class MediaWatcher(QObject):
                             cand_key, cand_n = None, 0
                             last_key, had_media = key, True
                             self.track_changed.emit(title, artist, album, duration, app_id)
-                            self.playback.emit(pos, playing, duration, age)
+                            self.playback.emit(pos, playing, duration, age, written)
                     else:
                         cand_key, cand_n = None, 0
-                        self.playback.emit(pos, playing, duration, age)
+                        self.playback.emit(pos, playing, duration, age, written)
             except Exception as exc:
                 print("SMTC error:", exc, file=sys.stderr)
                 manager = None
@@ -1107,6 +1111,12 @@ class LyricsWindow(QWidget):
         self._anchored = False         # a REAL timeline (with duration) was seen this track
         self._nudges = 0               # automatic re-sync attempts for this track
         self._nudged_at = 0.0
+        self._last_nudge_at = 0.0
+        self._nudge_log: list[float] = []     # times of recent re-syncs (rate limit)
+        self._resync_timer = QTimer(self)     # trailing debounce for "timeline rewritten"
+        self._resync_timer.setSingleShot(True)
+        self._resync_timer.setInterval(800)
+        self._resync_timer.timeout.connect(self._auto_resync_fire)
         self._anomaly = False          # SMTC shows other media (an ad?) -> lyrics frozen
         self._anomaly_at = 0.0
         self._stale = False            # after an ad: ignore the old timeline until refreshed
@@ -1428,14 +1438,15 @@ class LyricsWindow(QWidget):
         self.times = []
         self._track_key, self._last_idx = "", -1
         self._anchored, self._nudges, self.lyrics = False, 0, None
+        self._resync_timer.stop()
         _log("media: nothing playing")
         self.info.hide()
         self.track_text_changed.emit("")
         self.show_status("Waiting for music…",
                          "Play something in Spotify, YouTube, or any media app.")
 
-    def on_playback(self, position: float, playing: bool,
-                    duration: float = 0.0, age: float = 0.0) -> None:
+    def on_playback(self, position: float, playing: bool, duration: float = 0.0,
+                    age: float = 0.0, written: bool = False) -> None:
         """Feed SMTC samples into a local clock that survives bad data:
         * an EMPTY timeline (duration 0, position 0) at any point of a track - some
           browsers drop the timeline halfway through - is ignored and the local clock
@@ -1443,7 +1454,9 @@ class LyricsWindow(QWidget):
         * ads / other media (much shorter duration) freeze the lyrics, and the song
           resumes from the frozen point - the stale pre-ad timeline is ignored until
           the browser pushes a fresh update (or you press pause/play);
-        * big position jumps are only obeyed after SEEK_CONFIRM seconds of agreement;
+        * a seek is noticed when the player WRITES a new timeline: a real one is obeyed
+          at once, an empty one triggers an automatic re-sync (pause/play nudge);
+        * other big position jumps are only obeyed after SEEK_CONFIRM seconds;
         * small drift is smoothed."""
         now = time.monotonic()
         expected = self._pos_base + ((now - self._pos_stamp) if self._playing else 0.0)
@@ -1456,13 +1469,13 @@ class LyricsWindow(QWidget):
         empty = duration <= 0 and raw < 1.0
 
         # Empty timeline while (probably) mid-song, and we never got a real one: ask for a
-        # pause/play nudge so the browser publishes the true position. At most twice.
-        if (empty and not self._anchored and playing and self.auto_resync
-                and position > 5.0 and self._nudges < 2 and now - self._nudged_at > 8.0):
+        # pause/play nudge so the browser publishes the true position (first sample only).
+        if (empty and not self._anchored and playing and (
+                (self._fresh and position > 5.0 and self._nudges == 0)      # opened mid-song
+                or (self._nudges == 1 and now - self._nudged_at > 20.0))):  # one retry
             self._nudges += 1
             self._nudged_at = now
-            _log(f"sync: no real timeline at {position:.1f}s - requesting re-sync")
-            self.resync_requested.emit()
+            self._request_nudge(f"no real timeline at {position:.1f}s")
 
         if empty and not self._fresh:
             if not self._lost:
@@ -1471,6 +1484,10 @@ class LyricsWindow(QWidget):
                      f"(position {position:.1f}s ignored) - using local clock")
             if playing != self._playing:                    # still honour play / pause
                 self._pos_base, self._pos_stamp, self._playing = expected, now, playing
+            elif written and playing and age < 1.5:
+                # The player rewrote its (empty) timeline while playing = most likely a
+                # seek we cannot read. Wait until the writes stop, then re-sync once.
+                self._resync_timer.start()
             return
         if self._lost and not empty:
             self._lost, self._jump = False, None
@@ -1504,6 +1521,7 @@ class LyricsWindow(QWidget):
             self._anchored = True
             self._fresh = self._stale = False
             self._jump = None
+            self._resync_timer.stop()
             _log(f"sync: anchored to the real timeline at {position:.1f}s "
                  f"(clock was {expected:.1f}s)")
             self._pos_base, self._pos_stamp, self._playing = position, now, playing
@@ -1530,6 +1548,17 @@ class LyricsWindow(QWidget):
             self._jump = None
             self._pos_base = expected + delta * SYNC_SMOOTH
             self._pos_stamp = now
+            return
+
+        # 3b) the player just WROTE a real timeline that disagrees with our clock: the user
+        #     seeked (forward or backward). Obey immediately. (raw ~0 stays suspicious.)
+        if written and duration > 0 and raw >= 1.0 and age < 1.0:
+            self._jump = None
+            self._pos_base, self._pos_stamp = position, now
+            self._resync_timer.stop()
+            _log(f"sync: seek detected {expected:.1f}s -> {position:.1f}s (fresh timeline write)")
+            if self.times:
+                self.view.force_follow()
             return
 
         # 4) big difference: a seek or a glitch? Obey only if it stays consistent
@@ -1566,6 +1595,8 @@ class LyricsWindow(QWidget):
         self._track_dur, self._anomaly, self._stale = duration, False, False
         self._lost = False
         self._anchored, self._nudges, self._nudged_at = False, 0, 0.0
+        self._last_nudge_at = 0.0
+        self._resync_timer.stop()
         self.lyrics = None
         self._track_key = LyricsCache.key(title, artist)
         self.offset = float(self._load_offsets().get(self._track_key, 0.0))
@@ -1696,11 +1727,31 @@ class LyricsWindow(QWidget):
         self._render_lyrics()
 
     # -- re-sync -----------------------------------------------------------------
+    def _request_nudge(self, reason: str, manual: bool = False) -> bool:
+        """Ask the watcher to pause/play the player once. Automatic requests are rate
+        limited (3 per minute, 2.5 s apart) so a stubborn browser can never cause loops."""
+        now = time.monotonic()
+        self._nudge_log = [t for t in self._nudge_log if now - t < 60.0]
+        if not manual:
+            wait = 2.5 if self._anchored else 20.0     # last nudge did not help -> back off
+            if (not self.auto_resync or len(self._nudge_log) >= 3
+                    or now - self._last_nudge_at < wait):
+                return False
+        self._nudge_log.append(now)
+        self._last_nudge_at = now
+        self._anchored = False              # the next real timeline is accepted instantly
+        _log(f"sync: re-sync requested ({reason})")
+        self.resync_requested.emit()
+        return True
+
+    def _auto_resync_fire(self) -> None:
+        if self._playing and not self._anomaly:
+            self._request_nudge("player rewrote its timeline - seek?")
+
     def manual_resync(self) -> None:
         """The Sync button: accept the next real timeline instantly and nudge the player."""
-        self._anchored = False
         self._nudges = 0
-        self.resync_requested.emit()
+        self._request_nudge("Sync button", manual=True)
         self.source_label.setText("Syncing…")
         QTimer.singleShot(1800, lambda: self.source_label.setText(self._source_text))
 
