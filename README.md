@@ -5,6 +5,15 @@ track **and its playback position** from Windows media controls (Spotify, YouTub
 Chrome/Edge/Brave, etc.) and shows time-synced lyrics in a small dark, resizable
 window that lives in the system tray.
 
+## How the song is identified (LRCLIB)
+Lyric-video channels (e.g. "Musixa", "CbLyricsTV") are not the artist, so Windows reports the
+channel as the artist. AutoLyrics therefore reads the **title** first and tries what it says:
+`Artist - Song`, `Song - Artist`, `Song | Artist`, `Song ~ Artist`, `Song by Artist`,
+`"Song" ... | Artist`, a missing space (`ARTIST- SONG`), and `Artist x Other` / `ft.` variants.
+Then it falls back to the literal Windows values (official and "Topic" channels). Every hit must
+match the video's length and look like the requested title, so a wrong song is not accepted.
+The matched pair is written to `debug.log` (`LRCLIB match: artist - track`).
+
 ## Lyrics sources (automatic fallback)
 1. **YouTube uploaded Closed Captions** - for browser playback, the matching YouTube
    video is found via `yt-dlp` (title + duration match) and its captions are used.
@@ -72,8 +81,8 @@ then right-click `AutoLyrics.exe` > **Pin to taskbar**. If an old icon sticks, u
 Push a version tag and GitHub Actions attaches `AutoLyrics-windows.zip` to a Release
 (extract it and run `AutoLyrics\AutoLyrics.exe`):
 
-    git tag v1.4.2
-    git push origin v1.4.2
+    git tag v1.4.3
+    git push origin v1.4.3
 
 ## Usage
 - Tray icon click: show/hide. Right-click: Show/Hide, Always on Top, Exit.

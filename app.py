@@ -91,7 +91,7 @@ except Exception:  # pragma: no cover - CC layer simply gets skipped
     yt_dlp = None
 
 APP_NAME = "AutoLyrics"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 LRCLIB_API = "https://lrclib.net/api"
 USER_AGENT = f"{APP_NAME}/{APP_VERSION} (https://github.com/your-name/AutoLyrics)"
 
@@ -180,8 +180,8 @@ def parse_lrc(text: str | None) -> list[tuple[float, str]]:
 
 
 _NOISE = re.compile(
-    r"\s*[\(\[\{][^\)\]\}]*\b(official|lyrics?|lyric video|music video|video|"
-    r"audio|visuali[sz]er|hd|hq|4k|remaster(?:ed)?|explicit|mv)\b[^\)\]\}]*[\)\]\}]",
+    r"\s*[\(\[\{【][^\)\]\}】]*\b(official|lyrics?|lyric video|music video|video|"
+    r"audio|visuali[sz]er|hd|hq|4k|remaster(?:ed)?|explicit|mv)\b[^\)\]\}】]*[\)\]\}】]",
     re.I)
 _FEAT = re.compile(
     r"\s*[\(\[]\s*(?:feat|ft|featuring)\.?\s[^\)\]]*[\)\]]|\s+(?:feat|ft)\.?\s.*$", re.I)
@@ -202,22 +202,102 @@ def clean_artist(a: str) -> str:
     return " ".join(a.split())
 
 
+_QUOTED = re.compile(r"[\"“”«»]\s*([^\"“”«»]{2,}?)\s*[\"“”«»]")
+_DASH_SPLIT = re.compile(r"\s+[-–—‒―]+\s*|\s*[-–—‒―]+\s+")   # a space on at least one side
+_SEG_SPLIT = re.compile(r"\s*[|｜~•]\s*")
+_BY = re.compile(r"^(.+?)\s+by\s+(.+)$", re.I)
+_BARE_NOISE = re.compile(
+    r"\s*[\(\[]?\s*(?:with\s+)?(?:official\s+)?"
+    r"(?:lyric\s+video|lyrics?|audio|music\s+video|video|mv|hd|hq)\s*[\)\]]?\s*$", re.I)
+_ARTIST_SPLIT = re.compile(r"\s+(?:x|×|&|and|feat\.?|ft\.?|featuring|vs\.?)\s+|\s*,\s*", re.I)
+
+
+def _strip_noise(text: str) -> str:
+    """Remove (Lyrics) / [Official Video] / trailing 'lyrics' etc. and stray punctuation."""
+    text = _NOISE.sub("", text)
+    while True:                                       # "Song HD Lyrics" -> peel trailing noise
+        peeled = _BARE_NOISE.sub("", text)
+        if peeled == text or len(peeled.strip()) < 2:
+            break
+        text = peeled
+    return " ".join(text.split()).strip(" -–—‒―|~•\"“”«»")
+
+
+def artist_variants(name: str) -> list[str]:
+    """'Flow G x Hev Abi' -> ['Flow G x Hev Abi', 'Flow G', 'Flow G, Hev Abi']"""
+    name = " ".join(name.split())
+    parts = [x.strip() for x in _ARTIST_SPLIT.split(name) if x and x.strip()]
+    out = [_FEAT.sub("", name).strip() or name]
+    if len(parts) > 1:
+        out += [parts[0], ", ".join(parts)]
+    return list(dict.fromkeys(out))
+
+
+def parse_title(title: str) -> list[tuple[str, str]]:
+    """(track, artist) pairs that the TITLE itself claims. Lyric-video channels put the real
+    artist in the title while Windows only reports the channel name. Handles:
+    'Artist - Song', 'Song - Artist', 'Song | Artist', 'Song ~ Artist', 'Song by Artist',
+    '"Song" ... | Artist', and a missing space ('ARTIST- SONG')."""
+    t = " ".join((title or "").split())
+    out: list[tuple[str, str]] = []
+
+    def add(track: str, artist: str) -> None:
+        track = _strip_noise(_FEAT.sub("", track))
+        artist = _strip_noise(artist)
+        if not (2 <= len(track) <= 90 and 2 <= len(artist) <= 90):
+            return
+        if track.lower() == artist.lower() or (track, artist) in out:
+            return
+        out.append((track, artist))
+
+    # 1) a quoted song name:  piya - "Mahal Magmahal" | Esremborak [UNOFFICIAL MV]
+    m = _QUOTED.search(t)
+    if m:
+        rest = _NOISE.sub("", t[:m.start()] + " | " + t[m.end():])
+        for piece in re.split(r"\s*[|｜~•]\s*|\s+[-–—‒―]+\s*|\s*[-–—‒―]+\s+", rest):
+            if piece.strip(" -–—‒―"):
+                add(m.group(1), piece)
+
+    # 2) segments (| ~ •) and dashes
+    body = _strip_noise(t)
+    segs = [x for x in _SEG_SPLIT.split(body) if x.strip()]
+    units: list[str] = []
+    for seg in segs:
+        units += [u for u in _DASH_SPLIT.split(seg) if u.strip()]
+    if len(units) == 2:
+        title_first = len(segs) >= 2          # "Song | Artist"  vs  "Artist - Song"
+        a, b = units
+        pairs = [(a, b), (b, a)] if title_first else [(b, a), (a, b)]
+        for track, artist in pairs:
+            add(track, artist)
+    elif len(units) >= 3:                     # "Artist - Song - Live", "Label - Artist - Song"
+        for ai, ti in ((0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1)):
+            if ai < len(units) and ti < len(units):
+                add(units[ti], units[ai])
+    elif len(units) == 1:                     # "Song by Artist"
+        by = _BY.match(units[0])
+        if by:
+            add(by.group(1), by.group(2))
+    return out
+
+
 def build_candidates(title: str, artist: str) -> list[tuple[str, str]]:
-    """(track, artist) variants to try, most literal first."""
+    """(track, artist) variants to try. What the title says comes first (so lyric-video
+    channels work), then the literal Windows values (official / Topic channels)."""
     out: list[tuple[str, str]] = []
 
     def add(t: str, a: str) -> None:
         t, a = t.strip(), a.strip()
-        if t and (t, a) not in out:
+        if t and (t.lower(), a.lower()) not in {(x.lower(), y.lower()) for x, y in out}:
             out.append((t, a))
 
     ct, ca = clean_title(title), clean_artist(artist)
+    for t, a in parse_title(title):
+        for variant in artist_variants(a):
+            add(t, variant)
     add(title, artist)
     add(ct, ca)
-    parts = re.split(r"\s[-–—]\s", ct, maxsplit=1)   # "Artist - Song" on YouTube
-    if len(parts) == 2:
-        add(parts[1], parts[0])
-    return out
+    return out[:14]
 
 
 # ----------------------------------------------------------------------------
@@ -247,11 +327,23 @@ def _to_lyrics(data: dict | None) -> Lyrics | None:
     return Lyrics(synced, plain, instrumental, source)
 
 
-def _pick_best(results: list, duration: float) -> dict | None:
+def _name_ok(res: dict, track: str, artist: str) -> bool:
+    """The hit's title must share words with the track we asked for (or be contained in what
+    we asked for), so broader candidate lists cannot return an unrelated song."""
+    found = _tokens(res.get("trackName") or res.get("name") or "")
+    want = _tokens(track)
+    if not found or not want:
+        return True
+    return len(want & found) / len(want) >= 0.6 or found <= (want | _tokens(artist))
+
+
+def _pick_best(results: list, duration: float, want: tuple[str, str] | None = None) -> dict | None:
     if not isinstance(results, list):
         return None
     scored = []
     for r in results:
+        if want and not _name_ok(r, *want):
+            continue
         diff = abs((r.get("duration") or 0) - duration) if duration > 0 else 0
         if duration > 0 and diff > 10:      # almost certainly a different recording
             continue
@@ -265,9 +357,9 @@ def _pick_best(results: list, duration: float) -> dict | None:
     return scored[0][2]
 
 
-def fetch_lyrics(title: str, artist: str, album: str, duration: float
-                 ) -> tuple[Lyrics | None, bool]:
-    """Returns (lyrics_or_None, network_failed)."""
+def fetch_lyrics(title: str, artist: str, album: str, duration: float,
+                 trace: list[str] | None = None) -> tuple[Lyrics | None, bool]:
+    """Returns (lyrics_or_None, network_failed). `trace` gets 'LRCLIB match: artist - track'."""
     completed_any = False
     failed_any = False
 
@@ -283,33 +375,41 @@ def fetch_lyrics(title: str, artist: str, album: str, duration: float
 
     cands = build_candidates(title, artist)
 
+    def matched(t: str, a: str) -> None:
+        if trace is not None:
+            trace.append(f"LRCLIB match: {a} - {t}")
+
     # 1) exact signature lookups
-    for i, (t, a) in enumerate(cands):
+    for t, a in cands:
         if not a:
             continue
         params = {"track_name": t, "artist_name": a}
-        if i == 0 and album:
+        if album and (t, a) == (title, artist):      # the album belongs to the literal pair
             params["album_name"] = album
         if duration > 0:
             params["duration"] = int(round(duration))
         lyr = _to_lyrics(call("/get", params))
         if lyr:
+            matched(t, a)
             return lyr, False
 
-    # 2) fuzzy search
-    for t, a in cands[:3]:
+    # 2) fuzzy search (every hit must look like the request and match the duration)
+    for t, a in cands[:5]:
         q = f"{a} {t}".strip()
-        best = _pick_best(call("/search", {"q": q}) or [], duration)
+        best = _pick_best(call("/search", {"q": q}) or [], duration, (t, a))
         lyr = _to_lyrics(best)
         if lyr:
+            matched(best.get("trackName") or t, best.get("artistName") or a)
             return lyr, False
 
     t, a = cands[-1] if cands else (title, artist)
     params = {"track_name": t}
     if a:
         params["artist_name"] = a
-    lyr = _to_lyrics(_pick_best(call("/search", params) or [], duration))
+    best = _pick_best(call("/search", params) or [], duration, (t, a))
+    lyr = _to_lyrics(best)
     if lyr:
+        matched(best.get("trackName") or t, best.get("artistName") or a)
         return lyr, False
 
     return None, (failed_any and not completed_any)
@@ -510,7 +610,7 @@ def fetch_best_lyrics(title: str, artist: str, album: str, duration: float,
     else:
         trace.append(f"Captions: skipped (native player: {app_id})")
 
-    lyr, net_fail = fetch_lyrics(title, artist, album, duration)
+    lyr, net_fail = fetch_lyrics(title, artist, album, duration, trace)
     if lyr and lyr.synced:
         return lyr, False
     if cc_auto:
